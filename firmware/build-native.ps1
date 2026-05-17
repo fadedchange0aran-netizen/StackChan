@@ -66,10 +66,33 @@ function Invoke-NativeLoggedWithRetry {
     return $LastExitCode
 }
 
+function Resolve-FirstExistingPath {
+    param([string[]]$Candidates)
+    foreach ($Candidate in $Candidates) {
+        if ($Candidate -and (Test-Path $Candidate)) { return $Candidate }
+    }
+    return $null
+}
+
+function Get-LatestDirectoryPath {
+    param([string]$BasePath)
+    if (-not $BasePath -or -not (Test-Path $BasePath)) { return $null }
+    $Directory = Get-ChildItem -Path $BasePath -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+    if ($Directory) { return $Directory.FullName }
+    return $null
+}
+
+function Add-ExistingPath {
+    param([ref]$Paths, [string]$Candidate)
+    if ($Candidate -and (Test-Path $Candidate)) { $Paths.Value += $Candidate }
+}
+
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$IdfPath = "C:\Espressif\v5.5.4\esp-idf"
-$PythonEnvRoot = "C:\Users\77905\.espressif\python_env\idf5.5_py3.11_env"
-$PythonExe = "C:\Users\77905\.espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe"
+$DefaultIdfPath = "C:\Espressif\v5.5.4\esp-idf"
+$DefaultPythonEnv = Join-Path $env:USERPROFILE ".espressif\python_env\idf5.5_py3.11_env"
+$EspressifToolRoot = Join-Path $env:USERPROFILE ".espressif\tools"
 
 $IdfExportEnv = Join-Path (Split-Path $ProjectRoot -Parent) "idf-export.env"
 if (Test-Path $IdfExportEnv) {
@@ -88,21 +111,60 @@ if (Test-Path $IdfExportEnv) {
     }
 }
 
-$ToolPaths = @()
-$ToolPaths += "C:\Users\77905\.espressif\tools\xtensa-esp-elf-gdb\16.3_20250913\xtensa-esp-elf-gdb\bin"
-$ToolPaths += "C:\Users\77905\.espressif\tools\xtensa-esp-elf\esp-14.2.0_20260121\xtensa-esp-elf\bin"
-$ToolPaths += "C:\Users\77905\.espressif\tools\riscv32-esp-elf\esp-14.2.0_20260121\riscv32-esp-elf\bin"
-$ToolPaths += "C:\Users\77905\.espressif\tools\esp32ulp-elf\2.38_20240113\esp32ulp-elf\bin"
-$ToolPaths += "C:\Users\77905\.espressif\tools\cmake\3.30.2\bin"
-$ToolPaths += "C:\Users\77905\.espressif\tools\openocd-esp32\v0.12.0-esp32-20251215\openocd-esp32\bin"
-$ToolPaths += "C:\Users\77905\.espressif\tools\ninja\1.12.1"
-$ToolPaths += "C:\Users\77905\.espressif\tools\idf-exe\1.0.3"
-$ToolPaths += "C:\Users\77905\.espressif\tools\dfu-util\0.11\dfu-util-0.11-win64"
-$ToolPaths += "C:\Users\77905\.espressif\python_env\idf5.5_py3.11_env\Scripts"
-$ToolPaths += "C:\Espressif\v5.5.4\esp-idf\tools"
+$IdfPath = Resolve-FirstExistingPath @($env:IDF_PATH, $DefaultIdfPath)
+if (-not $IdfPath) { throw "ESP-IDF not found. Please set IDF_PATH or update build-native.ps1 for your local environment." }
 
-$AllPaths = @($IdfPath, $PythonEnvRoot, $PythonExe) + $ToolPaths
-foreach ($PathEntry in $AllPaths) { if (-not (Test-Path $PathEntry)) { throw "Required path not found: $PathEntry" } }
+$PythonEnvRoot = Resolve-FirstExistingPath @($env:IDF_PYTHON_ENV_PATH, $DefaultPythonEnv)
+$PythonCommand = Get-Command python -ErrorAction SilentlyContinue
+$PythonExe = Resolve-FirstExistingPath @(
+    $(if ($PythonEnvRoot) { Join-Path $PythonEnvRoot "Scripts\python.exe" }),
+    $(if ($env:IDF_PYTHON_ENV_PATH) { Join-Path $env:IDF_PYTHON_ENV_PATH "Scripts\python.exe" })
+)
+if (-not $PythonExe -and $PythonCommand) { $PythonExe = $PythonCommand.Source }
+if (-not $PythonExe) {
+    throw "ESP-IDF Python environment not found. Please set IDF_PYTHON_ENV_PATH or ensure python is available in PATH."
+}
+if (-not $PythonEnvRoot) {
+    $PythonEnvRoot = Split-Path (Split-Path $PythonExe -Parent) -Parent
+}
+
+$ToolPaths = @()
+Add-ExistingPath ([ref]$ToolPaths) (Join-Path $PythonEnvRoot "Scripts")
+Add-ExistingPath ([ref]$ToolPaths) (Join-Path $IdfPath "tools")
+
+$XtensaGdbRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "xtensa-esp-elf-gdb")
+if ($XtensaGdbRoot) { Add-ExistingPath ([ref]$ToolPaths) (Join-Path $XtensaGdbRoot "xtensa-esp-elf-gdb\bin") }
+
+$XtensaToolRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "xtensa-esp-elf")
+if ($XtensaToolRoot) { Add-ExistingPath ([ref]$ToolPaths) (Join-Path $XtensaToolRoot "xtensa-esp-elf\bin") }
+
+$RiscvToolRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "riscv32-esp-elf")
+if ($RiscvToolRoot) { Add-ExistingPath ([ref]$ToolPaths) (Join-Path $RiscvToolRoot "riscv32-esp-elf\bin") }
+
+$Esp32UlpRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "esp32ulp-elf")
+if ($Esp32UlpRoot) { Add-ExistingPath ([ref]$ToolPaths) (Join-Path $Esp32UlpRoot "esp32ulp-elf\bin") }
+
+$CmakeRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "cmake")
+if ($CmakeRoot) { Add-ExistingPath ([ref]$ToolPaths) (Join-Path $CmakeRoot "bin") }
+
+$OpenOcdRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "openocd-esp32")
+if ($OpenOcdRoot) { Add-ExistingPath ([ref]$ToolPaths) (Join-Path $OpenOcdRoot "openocd-esp32\bin") }
+
+$NinjaRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "ninja")
+Add-ExistingPath ([ref]$ToolPaths) $NinjaRoot
+
+$IdfExeRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "idf-exe")
+Add-ExistingPath ([ref]$ToolPaths) $IdfExeRoot
+
+$DfuUtilRoot = Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "dfu-util")
+if ($DfuUtilRoot) {
+    $DfuUtilBinRoot = Get-LatestDirectoryPath $DfuUtilRoot
+    Add-ExistingPath ([ref]$ToolPaths) $(if ($DfuUtilBinRoot) { $DfuUtilBinRoot } else { $DfuUtilRoot })
+}
+
+foreach ($PathEntry in @($IdfPath, $PythonEnvRoot, $PythonExe)) {
+    if (-not (Test-Path $PathEntry)) { throw "Required path not found: $PathEntry" }
+}
 
 $LogRoot = Join-Path $ProjectRoot "logs"
 $RunId = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -125,7 +187,7 @@ $env:IDF_CCACHE_ENABLE = "0"
 $env:IDF_PYTHON_ENV_PATH = $PythonEnvRoot
 
 # 设置本地组件管理器缓存路径，避免全局 AppData 权限问题
-$LocalComponentCache = "E:\STACKCHAN\StackChan\firmware\.cache"
+$LocalComponentCache = Join-Path $ProjectRoot ".cache"
 if (-not (Test-Path $LocalComponentCache)) { New-Item -ItemType Directory -Path $LocalComponentCache -Force | Out-Null }
 Set-Item -Path "Env:IDF_COMPONENT_MANAGER_CACHE_PATH" -Value $LocalComponentCache
 Set-Item -Path "Env:IDF_COMPONENT_MANAGER_STORAGE_URL" -Value "https://components.espressif.com/"
