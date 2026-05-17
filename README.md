@@ -174,6 +174,7 @@ MCP 或桥接器发起拍照请求
 - [flash.ps1](file:///E:/STACKCHAN/StackChan/firmware/flash.ps1)：Windows 下编译并烧录脚本
 - [monitor.ps1](file:///E:/STACKCHAN/StackChan/firmware/monitor.ps1)：Windows 下串口监控脚本
 - [build-native.ps1](file:///E:/STACKCHAN/StackChan/firmware/build-native.ps1)：Windows 下本地构建脚本
+- 说明：这几个脚本会优先读取你本机的 `ESP-IDF` 相关环境变量，并按常见安装路径自动探测；如果你的 Windows 环境和默认结构不同，仍然需要按自己的机器调整
 
 ## 运行前提
 
@@ -333,6 +334,9 @@ python vps_bridge.py
 ### 5. 编译 / 烧录固件
 
 Windows 下可以直接使用脚本：
+
+- 这些脚本不是对所有机器都完全通用的“一键安装器”
+- 如果你的 `ESP-IDF`、Python 环境或工具链安装位置不同，请先确认本机环境变量或按需修改脚本
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
