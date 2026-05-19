@@ -199,6 +199,21 @@ MCP 或桥接器发起拍照请求
 
 **能跑，但有前提。**
 
+## ⚠️ 重要提示：硬件优化补丁说明 (回滚残留提醒)
+
+**注意：当前仓库执行过 Git 回滚操作，部分关键的硬件优化补丁已被丢弃，请在下次部署前手动或通过 AI 恢复：**
+
+1.  **PSRAM 模式修复 (解决 WiFi 内存分配失败)**：
+    -   需在 `firmware/sdkconfig.defaults` 中确保开启 `CONFIG_SPIRAM_MODE_QUAD=y`。
+2.  **WiFi Modem Sleep 延迟修复 (解决语音丢包与延迟)**：
+    -   需在 `firmware/main/hal/board/stackchan.cc` 中将 `LOW_POWER` 模式收敛到 `BALANCED`。
+3.  **MCP 语音回环修复 (解决“听回自己说的话”)**：
+    -   需在 `vps_bridge.py` 的 `run_tts_response` 中加入 `session.audio_frames.clear()` 等清理逻辑。
+4.  **I2C 兼容性修复 (TryReadRegs)**：
+    -   若库版本较旧，需将 `stackchan.cc` 中的 `TryReadRegs` 替换为 `ReadRegs` 以通过编译。
+    -   *注：当前版本已手动将 `stackchan.cc` 中的调用改为 `ReadRegs` 以通过编译。*
+
+
 - 如果你只是想在本地电脑上运行 Python 桥接器，这个是可以的。
 - [vps_bridge.py](file:///E:/STACKCHAN/StackChan/vps_bridge.py) 默认会监听本机端口，对局域网开放。
 - 但机器人必须能够访问到你配置进固件的地址。
