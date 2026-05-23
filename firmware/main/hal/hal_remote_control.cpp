@@ -15,7 +15,7 @@
 #include <wifi_manager.h>
 #include <ArduinoJson.hpp>
 #include <mbedtls/base64.h>
-#include <image_to_jpeg.h>
+#include <esp_heap_caps.h>
 #include <board.h>
 #include "board/hal_bridge.h"
 #include "board/stackchan_camera.h"
@@ -36,6 +36,30 @@ static const char* _voice_ws_token_key = "token";
 static const char* _voice_ws_version_key = "version";
 
 namespace {
+
+constexpr uint32_t kPhotoCapturePowerSettleMs = 180;
+constexpr size_t kPhotoUploadRawChunkSize = 2048;
+
+bool EncodePhotoChunkToBase64(const uint8_t* data, size_t len, std::string& out)
+{
+    size_t encoded_len = 0;
+    int probe_ret = mbedtls_base64_encode(nullptr, 0, &encoded_len, data, len);
+    if (probe_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || encoded_len == 0) {
+        return false;
+    }
+
+    out.resize(encoded_len);
+    int encode_ret = mbedtls_base64_encode(reinterpret_cast<unsigned char*>(&out[0]),
+                                           out.size(),
+                                           &encoded_len,
+                                           data,
+                                           len);
+    if (encode_ret != 0 || encoded_len == 0) {
+        return false;
+    }
+    out.resize(encoded_len);
+    return true;
+}
 
 struct PendingLauncherAction {
     char action[24];
@@ -75,6 +99,19 @@ public:
 
 private:
     bool enabled_ = false;
+};
+
+class AtomicBoolResetGuard {
+public:
+    explicit AtomicBoolResetGuard(std::atomic<bool>& flag) : flag_(flag) {}
+
+    ~AtomicBoolResetGuard()
+    {
+        flag_ = false;
+    }
+
+private:
+    std::atomic<bool>& flag_;
 };
 
 bool RequiresLauncherMainLoop(const std::string& action_name)
@@ -394,6 +431,7 @@ public:
     void init(const std::string& vps_url) {
         _vps_url = vps_url;
         _deviceId = GetHAL().getFactoryMacString();
+        EnsurePhotoWorkerStarted();
         connect();
     }
 
@@ -412,8 +450,11 @@ public:
             return;
         }
 
-        // Recreate the websocket for each reconnect attempt so stale internal
-        // state from a previous disconnection does not accumulate.
+        {
+            std::lock_guard<std::mutex> lock(_websocket_mutex);
+            _websocket.reset();
+        }
+
         auto websocket = network->CreateWebSocket(5);
         if (!websocket) {
             ESP_LOGE(_tag, "Failed to create websocket");
@@ -454,10 +495,11 @@ public:
             _websocket = std::move(websocket);
         }
 
-        // 再次确认 _websocket 依然有效
         if (_websocket) {
             if (!_websocket->Connect(_vps_url.c_str())) {
                 ESP_LOGE(_tag, "Connect to VPS failed");
+                std::lock_guard<std::mutex> lock(_websocket_mutex);
+                _websocket.reset();
             }
         }
     }
@@ -478,10 +520,123 @@ public:
                 _last_heartbeat_time = GetHAL().millis();
             }
         }
+
     }
 
 private:
-    std::string BuildVisionExplainUrl() const {
+    enum class PhotoJobType {
+        Capture,
+        Interpret,
+    };
+
+    struct PhotoJob {
+        PhotoJobType type = PhotoJobType::Capture;
+        std::string prompt;
+        std::string url;
+        std::string token;
+    };
+
+    static constexpr uint32_t kPhotoWorkerStackSize = 6144;
+    static constexpr uint32_t kPhotoWorkerQueueDepth = 1;
+
+    static const char* PhotoJobTypeName(PhotoJobType type) {
+        switch (type) {
+            case PhotoJobType::Capture:
+                return "capture";
+            case PhotoJobType::Interpret:
+                return "interpret";
+            default:
+                return "unknown";
+        }
+    }
+
+    void EnsurePhotoWorkerStarted() {
+        if (_photo_worker_handle != nullptr && _photo_job_queue != nullptr) {
+            return;
+        }
+
+        if (_photo_job_queue == nullptr) {
+            _photo_job_queue = xQueueCreate(kPhotoWorkerQueueDepth, sizeof(PhotoJob*));
+            if (_photo_job_queue == nullptr) {
+                ESP_LOGE(_tag, "Failed to create photo worker queue");
+                return;
+            }
+        }
+
+        if (_photo_worker_handle == nullptr) {
+            if (xTaskCreate(&VPSBridgeClient::PhotoWorkerTask,
+                            "photo_worker",
+                            kPhotoWorkerStackSize,
+                            this,
+                            2,
+                            &_photo_worker_handle) != pdPASS) {
+                ESP_LOGE(_tag, "Failed to create photo worker task");
+                vQueueDelete(_photo_job_queue);
+                _photo_job_queue = nullptr;
+                return;
+            }
+            ESP_LOGI(_tag, "Photo worker started stack=%u queue=%u",
+                     static_cast<unsigned>(kPhotoWorkerStackSize),
+                     static_cast<unsigned>(kPhotoWorkerQueueDepth));
+        }
+    }
+
+    bool EnqueuePhotoJob(std::unique_ptr<PhotoJob> job) {
+        EnsurePhotoWorkerStarted();
+        if (_photo_job_queue == nullptr || _photo_worker_handle == nullptr || !job) {
+            return false;
+        }
+
+        PhotoJob* raw_job = job.release();
+        if (xQueueSend(_photo_job_queue, &raw_job, 0) != pdPASS) {
+            delete raw_job;
+            ESP_LOGW(_tag, "Photo worker queue is full");
+            return false;
+        }
+        return true;
+    }
+
+    static void PhotoWorkerTask(void* param) {
+        auto* client = static_cast<VPSBridgeClient*>(param);
+        client->RunPhotoWorker();
+    }
+
+    void RunPhotoWorker() {
+        while (true) {
+            PhotoJob* raw_job = nullptr;
+            if (xQueueReceive(_photo_job_queue, &raw_job, portMAX_DELAY) != pdPASS) {
+                continue;
+            }
+            if (raw_job == nullptr) {
+                continue;
+            }
+
+            std::unique_ptr<PhotoJob> job(raw_job);
+            AtomicBoolResetGuard photo_task_guard(_photo_task_running);
+            ESP_LOGI(_tag, "Photo worker begin type=%s", PhotoJobTypeName(job->type));
+
+            if (job->type == PhotoJobType::Capture) {
+                CaptureAndSendPhoto(job->url, job->token);
+            } else {
+                CaptureAndInterpretPhoto(job->prompt, job->url, job->token);
+            }
+
+            const UBaseType_t stack_hwm_words = uxTaskGetStackHighWaterMark(nullptr);
+            ESP_LOGI(_tag, "Photo worker done type=%s stack_hwm=%u words (%u bytes)",
+                     PhotoJobTypeName(job->type),
+                     static_cast<unsigned>(stack_hwm_words),
+                     static_cast<unsigned>(stack_hwm_words * sizeof(StackType_t)));
+        }
+    }
+
+    std::string BuildBridgeHttpUrl(const char* path) const {
+        if (path == nullptr || path[0] == '\0') {
+            return {};
+        }
+        if (strncmp(path, "https://", 8) == 0 || strncmp(path, "http://", 7) == 0) {
+            return std::string(path);
+        }
+
         std::string url = _vps_url;
         if (url.rfind("wss://", 0) == 0) {
             url.replace(0, 6, "https://");
@@ -494,8 +649,16 @@ private:
         if (path_pos != std::string::npos) {
             url.resize(path_pos);
         }
-        url += "/vision/explain";
+        url += path;
         return url;
+    }
+
+    std::string BuildVisionExplainUrl() const {
+        return BuildBridgeHttpUrl("/vision/explain");
+    }
+
+    std::string BuildPhotoCaptureUrl() const {
+        return BuildBridgeHttpUrl("/capture");
     }
 
     std::string LoadBridgeToken() const {
@@ -505,6 +668,105 @@ private:
             return token;
         }
         return PRIVATE_BRIDGE_TOKEN;
+    }
+
+    void StartRemoteTtsStream(const std::string& text, int emotion, int sample_rate, int frame_duration, int packet_count) {
+        ESP_LOGI(_tag, "Remote TTS stream start: text_len=%u packets=%d sample_rate=%d frame_ms=%d",
+                 static_cast<unsigned>(text.size()), packet_count, sample_rate, frame_duration);
+        bool launcher_mode = !GetHAL().isXiaozhiRunning();
+        UpdateRemoteTtsVisuals(text, emotion, launcher_mode);
+
+        if (launcher_mode) {
+            _tts_stream_active = false;
+            uint32_t generation = ++g_launcher_effect_generation;
+            ScheduleLauncherNeutralReset(generation, 2500);
+            if (packet_count > 0) {
+                ESP_LOGW(_tag, "Skip remote TTS stream playback in launcher mode");
+            }
+            return;
+        }
+
+        _tts_generation++;
+        _tts_stream_active = true;
+        _tts_stream_sample_rate = sample_rate > 0 ? sample_rate : 24000;
+        _tts_stream_frame_duration = frame_duration > 0 ? frame_duration : 60;
+        Application::GetInstance().GetAudioService().ResetDecoder();
+    }
+
+    void AbortRemoteTtsStream(const char* reason) {
+        const uint32_t generation = _tts_generation.load();
+        if (reason != nullptr && reason[0] != '\0') {
+            ESP_LOGW(_tag, "Abort remote TTS stream: %s", reason);
+        }
+        _tts_stream_active = false;
+        Application::GetInstance().GetAudioService().ResetDecoder();
+        ScheduleNeutralIfLatest(generation);
+    }
+
+    void AppendRemoteTtsStreamPacket(const char* packet_b64) {
+        if (!_tts_stream_active || packet_b64 == nullptr || packet_b64[0] == '\0') {
+            return;
+        }
+
+        size_t decoded_len = 0;
+        int probe_ret = mbedtls_base64_decode(nullptr, 0, &decoded_len,
+                                              reinterpret_cast<const unsigned char*>(packet_b64),
+                                              strlen(packet_b64));
+        if (probe_ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || decoded_len == 0) {
+            ESP_LOGE(_tag, "Failed to get decoded TTS stream packet length, code=%d", probe_ret);
+            AbortRemoteTtsStream("invalid base64 packet length");
+            return;
+        }
+
+        auto packet = std::make_unique<AudioStreamPacket>();
+        packet->sample_rate = _tts_stream_sample_rate;
+        packet->frame_duration = _tts_stream_frame_duration;
+        packet->payload.resize(decoded_len);
+
+        size_t output_len = 0;
+        int decode_ret = mbedtls_base64_decode(packet->payload.data(),
+                                               packet->payload.size(),
+                                               &output_len,
+                                               reinterpret_cast<const unsigned char*>(packet_b64),
+                                               strlen(packet_b64));
+        if (decode_ret != 0 || output_len == 0) {
+            ESP_LOGE(_tag, "Failed to decode TTS stream packet, code=%d", decode_ret);
+            AbortRemoteTtsStream("base64 decode failed");
+            return;
+        }
+
+        packet->payload.resize(output_len);
+        if (!Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), true)) {
+            ESP_LOGE(_tag, "Failed to queue TTS stream packet for playback");
+            AbortRemoteTtsStream("decoder queue push failed");
+        }
+    }
+
+    void FinishRemoteTtsStream() {
+        if (!_tts_stream_active) {
+            return;
+        }
+        _tts_stream_active = false;
+        ScheduleNeutralAfterPlayback(_tts_generation.load());
+    }
+
+    void StopRemoteTtsPlayback() {
+        ESP_LOGI(_tag, "Stopping remote TTS playback");
+        _tts_stream_active = false;
+        uint32_t generation = ++_tts_generation;
+
+        if (GetHAL().isXiaozhiRunning()) {
+            Application::GetInstance().GetAudioService().ResetDecoder();
+            ScheduleNeutralIfLatest(generation);
+            return;
+        }
+
+        uint32_t launcher_generation = ++g_launcher_effect_generation;
+        ApplyLauncherDisplayEmotion("neutral");
+        ApplyLauncherRgb(0, 0, 0);
+        GetStackChan().motion().goHome(220);
+        g_launcher_ui_hide_until = 0;
+        ScheduleLauncherNeutralReset(launcher_generation, 100);
     }
 
     void handleJsonMessage(const char* data, size_t len) {
@@ -520,63 +782,70 @@ private:
         } else if (type && strcmp(type, "tts") == 0) {
             cJSON* text_item = cJSON_GetObjectItem(root, "text");
             cJSON* audio_item = cJSON_GetObjectItem(root, "audio");
+            cJSON* audio_path_item = cJSON_GetObjectItem(root, "audio_path");
             cJSON* emotion_item = cJSON_GetObjectItem(root, "emotion");
 
             const char* text = (text_item && cJSON_IsString(text_item)) ? text_item->valuestring : "";
-            const char* audio_b64 = (audio_item && cJSON_IsString(audio_item)) ? audio_item->valuestring : "";
+            const char* audio_path = (audio_path_item && cJSON_IsString(audio_path_item)) ? audio_path_item->valuestring : "";
+            bool has_legacy_audio_b64 =
+                audio_item && cJSON_IsString(audio_item) && audio_item->valuestring != nullptr &&
+                audio_item->valuestring[0] != '\0';
             int emotion = (emotion_item && cJSON_IsNumber(emotion_item)) ? emotion_item->valueint : 5;
             std::string text_str = text;
-            
-            ESP_LOGI(_tag, "Remote TTS received: %s (Audio len: %d)", text, (int)strlen(audio_b64));
+
+            ESP_LOGI(_tag, "Remote TTS received: %s (audio_path_len=%d, legacy_audio_b64=%d)",
+                     text, static_cast<int>(strlen(audio_path)), has_legacy_audio_b64 ? 1 : 0);
+            if (has_legacy_audio_b64) {
+                ESP_LOGW(_tag, "Ignoring deprecated remote TTS audio payload; use tts_stream_*");
+            }
+            if (strlen(audio_path) > 0) {
+                ESP_LOGW(_tag, "Ignoring deprecated remote TTS audio_path payload; use tts_stream_*");
+            }
+
             bool launcher_mode = !GetHAL().isXiaozhiRunning();
-            
+
             // 1. 显示文字并设置表情
             UpdateRemoteTtsVisuals(text_str, emotion, launcher_mode);
-            
+
             if (launcher_mode) {
                 uint32_t generation = ++g_launcher_effect_generation;
                 ScheduleLauncherNeutralReset(generation, 2500);
-                if (strlen(audio_b64) > 0) {
-                    ESP_LOGI(_tag, "Skip remote TTS audio playback in launcher mode");
-                }
             }
-            
-            // 2. 播放音频流
-            if (!launcher_mode && strlen(audio_b64) > 0) {
-                uint32_t tts_generation = ++_tts_generation;
-                size_t decoded_len = 0;
-                if (mbedtls_base64_decode(nullptr, 0, &decoded_len,
-                                          reinterpret_cast<const unsigned char*>(audio_b64),
-                                          strlen(audio_b64)) == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) {
-                    std::string audio_data(decoded_len, '\0');
-                    size_t output_len = 0;
-                    int ret = mbedtls_base64_decode(reinterpret_cast<unsigned char*>(audio_data.data()),
-                                                    audio_data.size(),
-                                                    &output_len,
-                                                    reinterpret_cast<const unsigned char*>(audio_b64),
-                                                    strlen(audio_b64));
-                    if (ret == 0 && output_len > 0) {
-                        audio_data.resize(output_len);
-                        hal_bridge::app_play_sound(std::string_view(audio_data.data(), audio_data.size()));
-                        ScheduleNeutralAfterPlayback(tts_generation);
-                    } else {
-                        ESP_LOGE(_tag, "Failed to decode remote TTS audio, code=%d", ret);
-                    }
-                } else {
-                    ESP_LOGE(_tag, "Failed to get decoded TTS audio length");
-                }
-            }
+        } else if (type && strcmp(type, "tts_stream_start") == 0) {
+            cJSON* text_item = cJSON_GetObjectItem(root, "text");
+            cJSON* emotion_item = cJSON_GetObjectItem(root, "emotion");
+            cJSON* sample_rate_item = cJSON_GetObjectItem(root, "sample_rate");
+            cJSON* frame_duration_item = cJSON_GetObjectItem(root, "frame_duration");
+            cJSON* packet_count_item = cJSON_GetObjectItem(root, "packet_count");
+
+            const char* text = (text_item && cJSON_IsString(text_item)) ? text_item->valuestring : "";
+            int emotion = (emotion_item && cJSON_IsNumber(emotion_item)) ? emotion_item->valueint : 5;
+            int sample_rate = (sample_rate_item && cJSON_IsNumber(sample_rate_item)) ? sample_rate_item->valueint : 24000;
+            int frame_duration = (frame_duration_item && cJSON_IsNumber(frame_duration_item)) ? frame_duration_item->valueint : 60;
+            int packet_count = (packet_count_item && cJSON_IsNumber(packet_count_item)) ? packet_count_item->valueint : 0;
+
+            StartRemoteTtsStream(text, emotion, sample_rate, frame_duration, packet_count);
+        } else if (type && strcmp(type, "tts_stream_chunk") == 0) {
+            cJSON* data_item = cJSON_GetObjectItem(root, "data");
+            const char* packet_b64 = (data_item && cJSON_IsString(data_item)) ? data_item->valuestring : "";
+            AppendRemoteTtsStreamPacket(packet_b64);
+        } else if (type && strcmp(type, "tts_stream_end") == 0) {
+            FinishRemoteTtsStream();
+        } else if (type && strcmp(type, "stop_tts") == 0) {
+            StopRemoteTtsPlayback();
         } else if (type && strcmp(type, "capture_photo") == 0) {
             ESP_LOGI(_tag, "Remote capture_photo request received");
             if (_photo_task_running.exchange(true)) {
                 ESP_LOGW(_tag, "Photo capture already in progress, ignoring duplicate request");
+                SendCaptureResult("已有拍照任务在执行，请稍后重试。", false);
             } else {
-                auto* ctx = new PhotoCaptureContext{this};
-                if (xTaskCreatePinnedToCoreWithCaps(&VPSBridgeClient::CapturePhotoTask, "robot_photo", 1024 * 12, ctx, 3,
-                                                    nullptr, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
-                    delete ctx;
+                auto job = std::make_unique<PhotoJob>();
+                job->type = PhotoJobType::Capture;
+                job->url = BuildPhotoCaptureUrl();
+                job->token = LoadBridgeToken();
+                if (!EnqueuePhotoJob(std::move(job))) {
                     _photo_task_running = false;
-                    ESP_LOGE(_tag, "Failed to create photo capture task");
+                    SendCaptureResult("拍照 worker 不可用或队列已满。", false);
                 }
             }
         } else if (type && strcmp(type, "interpret_photo") == 0) {
@@ -585,13 +854,16 @@ private:
             ESP_LOGI(_tag, "Remote interpret_photo request received");
             if (_photo_task_running.exchange(true)) {
                 ESP_LOGW(_tag, "Photo task already in progress, ignoring interpret request");
+                SendInterpretResult("已有拍照任务在执行，请稍后重试。", false);
             } else {
-                auto* ctx = new PhotoInterpretContext{this, std::string(prompt)};
-                if (xTaskCreatePinnedToCoreWithCaps(&VPSBridgeClient::InterpretPhotoTask, "robot_vision", 1024 * 14, ctx, 3,
-                                                    nullptr, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
-                    delete ctx;
+                auto job = std::make_unique<PhotoJob>();
+                job->type = PhotoJobType::Interpret;
+                job->prompt = prompt;
+                job->url = BuildVisionExplainUrl();
+                job->token = LoadBridgeToken();
+                if (!EnqueuePhotoJob(std::move(job))) {
                     _photo_task_running = false;
-                    ESP_LOGE(_tag, "Failed to create interpret photo task");
+                    SendInterpretResult("拍照 worker 不可用或队列已满。", false);
                 }
             }
         } else if (type && strcmp(type, "hw_control") == 0) {
@@ -629,10 +901,10 @@ private:
             
             if (!xiaozhi) {
                 // 1. 设置 WebSocket 参数 (官方协议使用的命名空间)
-                Settings ws_settings("websocket", true);
-                ws_settings.SetString("url", PRIVATE_XIAOZHI_WS_URL);
-                ws_settings.SetString("token", PRIVATE_BRIDGE_TOKEN);
-                ws_settings.SetInt("version", 1);
+                Settings ws_settings(_voice_ws_setting_ns, true);
+                ws_settings.SetString(_voice_ws_url_key, PRIVATE_XIAOZHI_WS_URL);
+                ws_settings.SetString(_voice_ws_token_key, PRIVATE_BRIDGE_TOKEN);
+                ws_settings.SetInt(_voice_ws_version_key, 1);
                 
                 // 2. 清空 MQTT 终端，强制系统选择 WebSocket 协议
                 Settings mqtt_settings("mqtt", true);
@@ -653,9 +925,9 @@ private:
                 Settings mqtt_settings("mqtt", true);
                 mqtt_settings.SetString("endpoint", "");
                 
-                Settings ws_settings("websocket", true);
-                ws_settings.SetString("url", "");
-                ws_settings.SetString("token", "");
+                Settings ws_settings(_voice_ws_setting_ns, true);
+                ws_settings.SetString(_voice_ws_url_key, "");
+                ws_settings.SetString(_voice_ws_token_key, "");
                 
                 // 标记为未配置，这样启动时可能会重新进入激活流程
                 Settings app_settings("app_config", true);
@@ -676,28 +948,10 @@ private:
         uint32_t generation;
     };
 
-    struct PhotoCaptureContext {
-        VPSBridgeClient* client;
+    struct PhotoCapturePowerState {
+        uint8_t previous_speaker_volume = 0;
+        bool muted_speaker = false;
     };
-
-    struct PhotoInterpretContext {
-        VPSBridgeClient* client;
-        std::string prompt;
-    };
-
-    static void CapturePhotoTask(void* param) {
-        std::unique_ptr<PhotoCaptureContext> ctx(static_cast<PhotoCaptureContext*>(param));
-        ctx->client->CaptureAndSendPhoto();
-        ctx->client->_photo_task_running = false;
-        vTaskDelete(nullptr);
-    }
-
-    static void InterpretPhotoTask(void* param) {
-        std::unique_ptr<PhotoInterpretContext> ctx(static_cast<PhotoInterpretContext*>(param));
-        ctx->client->CaptureAndInterpretPhoto(ctx->prompt);
-        ctx->client->_photo_task_running = false;
-        vTaskDelete(nullptr);
-    }
 
     static void RestoreNeutralTask(void* param) {
         std::unique_ptr<EmotionResetContext> ctx(static_cast<EmotionResetContext*>(param));
@@ -756,108 +1010,170 @@ private:
         }
     }
 
-    void CaptureAndSendPhoto() {
+    bool PrepareForPhotoCapture(PhotoCapturePowerState& state) {
+        StopRemoteTtsPlayback();
+
+        state = {};
+        state.previous_speaker_volume = GetHAL().getSpeakerVolume();
+        if (state.previous_speaker_volume > 0) {
+            GetHAL().setSpeakerVolume(0, false);
+            state.muted_speaker = true;
+            ESP_LOGI(_tag, "Photo capture prep: mute speaker %u -> 0",
+                     static_cast<unsigned>(state.previous_speaker_volume));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(kPhotoCapturePowerSettleMs));
+        return true;
+    }
+
+    void RestoreAfterPhotoCapture(const PhotoCapturePowerState& state) {
+        if (state.muted_speaker) {
+            GetHAL().setSpeakerVolume(state.previous_speaker_volume, false);
+        }
+    }
+
+    void CaptureAndSendPhoto(const std::string& capture_url, const std::string& bridge_token) {
+        (void)capture_url;
+        (void)bridge_token;
+        TaskPriorityReset priority_reset(1);
         auto camera = static_cast<StackChanCamera*>(hal_bridge::board_get_camera());
         if (!camera) {
             ESP_LOGE(_tag, "Camera not available");
-            return;
-        }
-        if (!camera->Capture()) {
-            ESP_LOGE(_tag, "Camera capture failed");
+            SendCaptureResult("相机不可用。", false);
             return;
         }
 
-        uint8_t* jpeg_buf = nullptr;
-        size_t jpeg_len = 0;
-        if (!image_to_jpeg((uint8_t*)camera->GetFrameData(), camera->GetFrameSize(), camera->GetFrameWidth(),
-                           camera->GetFrameHeight(), (v4l2_pix_fmt_t)camera->GetFrameFormat(), 25, &jpeg_buf,
-                           &jpeg_len)) {
-            ESP_LOGE(_tag, "JPEG encode failed");
+        camera->SetExplainUrl(capture_url, bridge_token);
+        PhotoCapturePowerState power_state{};
+        if (!PrepareForPhotoCapture(power_state)) {
+            SendCaptureResult("拍照准备失败。", false);
             return;
         }
 
-        if (!jpeg_buf || jpeg_len == 0) {
-            ESP_LOGE(_tag, "JPEG buffer empty");
-            free(jpeg_buf);
-            return;
-        }
-
-        if (!_websocket || !_websocket->IsConnected()) {
-            ESP_LOGW(_tag, "Control websocket disconnected before photo upload");
-            free(jpeg_buf);
-            return;
-        }
-
-        static constexpr size_t kRawChunkBytes = 3072;  // multiple of 3, so intermediate base64 chunks have no padding
-        static constexpr size_t kMaxChunkB64Bytes = ((kRawChunkBytes + 2) / 3) * 4;
-        const size_t total_chunks = (jpeg_len + kRawChunkBytes - 1) / kRawChunkBytes;
-
-        std::string begin_msg = "{\"type\":\"photo_begin\",\"size\":";
-        begin_msg += std::to_string(jpeg_len);
-        begin_msg += ",\"total_chunks\":";
-        begin_msg += std::to_string(total_chunks);
-        begin_msg += "}";
-
-        {
-            std::lock_guard<std::mutex> lock(_websocket_mutex);
-            if (_websocket && _websocket->IsConnected()) {
-                _websocket->Send(begin_msg.c_str());
+        try {
+            if (!camera->Capture()) {
+                ESP_LOGE(_tag, "Camera capture failed");
+                SendCaptureResult("拍照失败。", false);
+            } else if (!StreamCapturedPhotoOverWebSocket(*camera)) {
+                ESP_LOGE(_tag, "Photo websocket upload failed");
+                SendCaptureResult("拍照失败: 通过桥接 WebSocket 回传图片失败。", false);
+            } else {
+                ESP_LOGI(_tag, "Photo uploaded through bridge websocket");
             }
+        } catch (const std::exception& exc) {
+            ESP_LOGE(_tag, "Photo capture/upload failed: %s", exc.what());
+            SendCaptureResult(std::string("拍照失败: ") + exc.what(), false);
+        } catch (...) {
+            ESP_LOGE(_tag, "Photo capture/upload failed with unknown error");
+            SendCaptureResult("拍照失败: 未知错误", false);
         }
-
-        char* b64_buf = static_cast<char*>(heap_caps_malloc(kMaxChunkB64Bytes + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!b64_buf) {
-            ESP_LOGE(_tag, "Failed to allocate photo chunk buffer");
-            free(jpeg_buf);
-            return;
-        }
-
-        size_t sent_chunks = 0;
-        for (size_t offset = 0; offset < jpeg_len; offset += kRawChunkBytes) {
-            const size_t remaining = jpeg_len - offset;
-            const size_t raw_len = remaining < kRawChunkBytes ? remaining : kRawChunkBytes;
-            size_t encoded_len = 0;
-            int encode_ret = mbedtls_base64_encode(reinterpret_cast<unsigned char*>(b64_buf), kMaxChunkB64Bytes + 1,
-                                                   &encoded_len, jpeg_buf + offset, raw_len);
-            if (encode_ret != 0) {
-                ESP_LOGE(_tag, "Base64 encode failed at chunk=%u code=%d", static_cast<unsigned>(sent_chunks), encode_ret);
-                heap_caps_free(b64_buf);
-                free(jpeg_buf);
-                return;
-            }
-            b64_buf[encoded_len] = '\0';
-
-            std::string chunk_msg = "{\"type\":\"photo_chunk\",\"index\":";
-            chunk_msg += std::to_string(sent_chunks);
-            chunk_msg += ",\"data\":\"";
-            chunk_msg.append(b64_buf, encoded_len);
-            chunk_msg += "\"}";
-
-            std::lock_guard<std::mutex> lock(_websocket_mutex);
-            if (!_websocket || !_websocket->IsConnected()) {
-                ESP_LOGW(_tag, "Control websocket disconnected during photo upload");
-                heap_caps_free(b64_buf);
-                free(jpeg_buf);
-                return;
-            }
-            _websocket->Send(chunk_msg.c_str());
-            sent_chunks++;
-        }
-
-        heap_caps_free(b64_buf);
-        free(jpeg_buf);
-
-        {
-            std::lock_guard<std::mutex> lock(_websocket_mutex);
-            if (_websocket && _websocket->IsConnected()) {
-                _websocket->Send("{\"type\":\"photo_end\"}");
-            }
-        }
-        ESP_LOGI(_tag, "Photo upload completed jpeg=%u chunks=%u", static_cast<unsigned>(jpeg_len),
-                 static_cast<unsigned>(sent_chunks));
+        RestoreAfterPhotoCapture(power_state);
     }
 
-    void CaptureAndInterpretPhoto(const std::string& prompt) {
+    bool StreamCapturedPhotoOverWebSocket(StackChanCamera& camera) {
+        uint8_t* frame_data = const_cast<uint8_t*>(camera.GetFrameData());
+        size_t frame_size = camera.GetFrameSize();
+        uint16_t frame_width = static_cast<uint16_t>(camera.GetFrameWidth());
+        uint16_t frame_height = static_cast<uint16_t>(camera.GetFrameHeight());
+        v4l2_pix_fmt_t frame_format = static_cast<v4l2_pix_fmt_t>(camera.GetFrameFormat());
+
+        if (frame_data == nullptr || frame_size == 0 || frame_width == 0 || frame_height == 0 || frame_format == 0) {
+            ESP_LOGE(_tag, "Invalid frame for websocket upload");
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_websocket_mutex);
+            if (!_websocket || !_websocket->IsConnected()) {
+                ESP_LOGE(_tag, "Bridge websocket is not connected");
+                return false;
+            }
+        }
+
+        ArduinoJson::JsonDocument begin_doc;
+        begin_doc["type"] = "photo_begin";
+        begin_doc["size"] = 0;
+        begin_doc["total_chunks"] = 0;
+        if (!SendWebSocketJson(begin_doc)) {
+            return false;
+        }
+
+        struct UploadContext {
+            VPSBridgeClient* client;
+            bool failed = false;
+            size_t raw_bytes = 0;
+            size_t chunk_count = 0;
+        } ctx{this};
+
+        bool jpeg_ok = image_to_jpeg_cb(
+            frame_data,
+            frame_size,
+            frame_width,
+            frame_height,
+            frame_format,
+            60,
+            [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+                auto* ctx = static_cast<UploadContext*>(arg);
+                if (ctx->failed || data == nullptr || len == 0) {
+                    return 0;
+                }
+
+                const uint8_t* bytes = static_cast<const uint8_t*>(data);
+                size_t offset = 0;
+                while (offset < len) {
+                    size_t part_len = std::min(kPhotoUploadRawChunkSize, len - offset);
+                    std::string b64_chunk;
+                    if (!EncodePhotoChunkToBase64(bytes + offset, part_len, b64_chunk)) {
+                        ESP_LOGE(_tag, "Failed to base64 encode JPEG chunk at index=%u", static_cast<unsigned>(index));
+                        ctx->failed = true;
+                        return offset;
+                    }
+
+                    ArduinoJson::JsonDocument chunk_doc;
+                    chunk_doc["type"] = "photo_chunk";
+                    chunk_doc["index"] = ctx->chunk_count;
+                    chunk_doc["data"] = b64_chunk;
+                    if (!ctx->client->SendWebSocketJson(chunk_doc)) {
+                        ESP_LOGE(_tag, "Failed to send photo websocket chunk=%u", static_cast<unsigned>(ctx->chunk_count));
+                        ctx->failed = true;
+                        return offset;
+                    }
+
+                    ctx->raw_bytes += part_len;
+                    ctx->chunk_count++;
+                    offset += part_len;
+                }
+                return len;
+            },
+            &ctx);
+
+        if (!jpeg_ok || ctx.failed || ctx.chunk_count == 0) {
+            ESP_LOGE(_tag, "JPEG encode or websocket upload failed raw=%u chunks=%u ok=%d failed=%d",
+                     static_cast<unsigned>(ctx.raw_bytes),
+                     static_cast<unsigned>(ctx.chunk_count),
+                     jpeg_ok ? 1 : 0,
+                     ctx.failed ? 1 : 0);
+            return false;
+        }
+
+        ArduinoJson::JsonDocument end_doc;
+        end_doc["type"] = "photo_end";
+        end_doc["total_chunks"] = ctx.chunk_count;
+        end_doc["size"] = ctx.raw_bytes;
+        if (!SendWebSocketJson(end_doc)) {
+            return false;
+        }
+
+        ESP_LOGI(_tag, "Photo websocket upload complete raw=%u chunks=%u",
+                 static_cast<unsigned>(ctx.raw_bytes),
+                 static_cast<unsigned>(ctx.chunk_count));
+        return true;
+    }
+
+    void CaptureAndInterpretPhoto(const std::string& prompt, const std::string& explain_url, const std::string& bridge_token) {
+        (void)prompt;
+        (void)explain_url;
+        (void)bridge_token;
         auto camera = static_cast<StackChanCamera*>(hal_bridge::board_get_camera());
         if (!camera) {
             ESP_LOGE(_tag, "Camera not available for interpret");
@@ -865,18 +1181,23 @@ private:
             return;
         }
 
-        camera->SetExplainUrl(BuildVisionExplainUrl(), LoadBridgeToken());
         TaskPriorityReset priority_reset(1);
+        PhotoCapturePowerState power_state{};
+        if (!PrepareForPhotoCapture(power_state)) {
+            SendInterpretResult("拍照准备失败。", false);
+            return;
+        }
 
         try {
             if (!camera->Capture()) {
                 ESP_LOGE(_tag, "Camera capture failed for interpret");
                 SendInterpretResult("拍照失败。", false);
-                return;
+            } else if (!StreamCapturedPhotoOverWebSocket(*camera)) {
+                ESP_LOGE(_tag, "Photo websocket upload failed for interpret");
+                SendInterpretResult("视觉解读失败: 通过桥接 WebSocket 回传图片失败。", false);
+            } else {
+                ESP_LOGI(_tag, "Interpret photo image uploaded through bridge websocket");
             }
-            std::string result = camera->Explain(prompt);
-            ESP_LOGI(_tag, "Interpret photo done, text_len=%u", static_cast<unsigned>(result.size()));
-            SendInterpretResult(result, true);
         } catch (const std::exception& exc) {
             ESP_LOGE(_tag, "Interpret photo failed: %s", exc.what());
             SendInterpretResult(std::string("视觉解读失败: ") + exc.what(), false);
@@ -884,6 +1205,7 @@ private:
             ESP_LOGE(_tag, "Interpret photo failed with unknown error");
             SendInterpretResult("视觉解读失败: 未知错误", false);
         }
+        RestoreAfterPhotoCapture(power_state);
     }
 
     void SendInterpretResult(const std::string& text, bool ok) {
@@ -891,22 +1213,46 @@ private:
         doc["type"] = "photo_interpret_result";
         doc["ok"] = ok;
         doc["text"] = text;
+        SendWebSocketJson(doc);
+    }
+
+    void SendCaptureResult(const std::string& value, bool ok) {
+        ArduinoJson::JsonDocument doc;
+        doc["type"] = "photo_capture_result";
+        doc["ok"] = ok;
+        if (ok) {
+            doc["path"] = value;
+        } else {
+            doc["message"] = value;
+        }
+
+        SendWebSocketJson(doc);
+    }
+
+    bool SendWebSocketJson(const ArduinoJson::JsonDocument& doc) {
         std::string out;
         ArduinoJson::serializeJson(doc, out);
 
         std::lock_guard<std::mutex> lock(_websocket_mutex);
         if (_websocket && _websocket->IsConnected()) {
             _websocket->Send(out.c_str());
+            return true;
         }
+        return false;
     }
 
     std::unique_ptr<WebSocket> _websocket;
     std::mutex _websocket_mutex;
+    QueueHandle_t _photo_job_queue = nullptr;
+    TaskHandle_t _photo_worker_handle = nullptr;
     std::string _vps_url;
     std::string _deviceId;
     uint32_t _last_reconnect_attempt = 0;
     uint32_t _last_heartbeat_time = 0;
     std::atomic<uint32_t> _tts_generation{0};
+    int _tts_stream_sample_rate = 24000;
+    int _tts_stream_frame_duration = 60;
+    bool _tts_stream_active = false;
     std::atomic<bool> _photo_task_running{false};
 };
 

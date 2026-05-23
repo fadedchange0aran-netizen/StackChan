@@ -197,7 +197,8 @@ public:
 
     bool UpdateTouchPoint()
     {
-        auto err = TryReadRegs(0x02, read_buffer_, 6);
+        uint8_t register_addr = 0x02;
+        esp_err_t err = i2c_master_transmit_receive(i2c_device_, &register_addr, 1, read_buffer_, 6, 100);
         if (err != ESP_OK) {
             tp_.num = 0;
             tp_.x   = -1;
@@ -538,10 +539,21 @@ public:
         return true;
     }
 
+    bool HasExternalPower() const
+    {
+        return pmic_->IsExternalPowerConnected();
+    }
+
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override
     {
         if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
+        }
+        // StackChan's Wi-Fi link is noticeably less stable in modem-sleep low
+        // power mode during websocket voice traffic, so keep the floor at
+        // BALANCED even when callers request LOW_POWER.
+        if (level == PowerSaveLevel::LOW_POWER) {
+            level = PowerSaveLevel::BALANCED;
         }
         WifiBoard::SetPowerSaveLevel(level);
     }
@@ -599,6 +611,12 @@ bool hal_bridge::board_is_battery_charging()
     }
 }
 
+bool hal_bridge::board_has_external_power()
+{
+    auto& board = (M5StackCoreS3Board&)Board::GetInstance();
+    return board.HasExternalPower();
+}
+
 void hal_bridge::board_set_backlight_brightness(uint8_t brightness, bool permanent)
 {
     auto& board    = Board::GetInstance();
@@ -628,8 +646,10 @@ void hal_bridge::board_set_speaker_volume(uint8_t volume, bool permanent)
     auto& board      = Board::GetInstance();
     auto audio_codec = board.GetAudioCodec();
     if (audio_codec) {
+        audio_codec->SetOutputVolume(volume);
         if (permanent) {
-            audio_codec->SetOutputVolume(volume);
+            Settings settings("audio", true);
+            settings.SetInt("output_volume", volume);
         }
     }
 }
@@ -645,12 +665,3 @@ uint8_t hal_bridge::board_get_speaker_volume()
     return volume;
 }
 
-void hal_bridge::toggle_xiaozhi_chat_state()
-{
-    auto& app = Application::GetInstance();
-    if (app.GetDeviceState() == kDeviceStateStarting) {
-        // EnterWifiConfigMode();
-        return;
-    }
-    app.ToggleChatState();
-}

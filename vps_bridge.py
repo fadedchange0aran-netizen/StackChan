@@ -88,6 +88,7 @@ CONFIG = {
     "VOICE_NAME": env_str("STACKCHAN_VOICE_NAME", "zh-CN-YunxiNeural"),
     "VOICE_WS_URL": env_str("STACKCHAN_VOICE_WS_URL"),
     "VOICE_WS_TOKEN": env_str("STACKCHAN_VOICE_WS_TOKEN"),
+    "CONTROL_WS_TOKEN": env_str("STACKCHAN_CONTROL_WS_TOKEN").strip() or env_str("STACKCHAN_VOICE_WS_TOKEN"),
     "VOICE_PROTOCOL_VERSION": env_int("STACKCHAN_VOICE_PROTOCOL_VERSION", 1),
     "VOICE_FINALIZE_SILENCE_SECONDS": env_float("STACKCHAN_VOICE_FINALIZE_SILENCE_SECONDS", 0.25),
     "VOICE_LISTENING_GUARD_MS": env_int("STACKCHAN_VOICE_LISTENING_GUARD_MS", 350),
@@ -244,6 +245,7 @@ class VoiceSession:
     audio_frame_count: int = 0
     audio_byte_count: int = 0
     listening_guard_until: float = 0.0
+    playback_guard_until: float = 0.0
     listening_guard_dropped_frames: int = 0
     last_stt_feedback_text: str = ""
     last_stt_feedback_at: float = 0.0
@@ -285,6 +287,7 @@ robot_histories: Dict[str, Deque[dict]] = defaultdict(
 voice_sessions: Dict[str, VoiceSession] = {}
 photo_futures: Dict[str, asyncio.Future] = {}
 interpret_futures: Dict[str, asyncio.Future] = {}
+interpret_requests: Dict[str, dict] = {}
 photo_uploads: Dict[str, dict] = {}
 
 
@@ -372,6 +375,7 @@ _ECHO_STT_HINT = "刚才像是回声，你再说一遍。"
 _NOISE_STT_HINT = "刚刚像是杂音，你再说一遍。"
 _LOW_CONFIDENCE_STT_HINT = "刚刚这句不太确定，你再说一遍。"
 _LOW_ENERGY_STT_HINT = "刚刚声音太轻或环境太安静，你再说一遍。"
+_TTS_PREPARE_FAILED_HINT = "这句已经生成出来了，但语音播报失败了。"
 _BUILTIN_STT_PROMPT = "这是中文口语对话。如果没有听清或只有杂音，请尽量返回空文本，不要脑补，不要补全。"
 
 
@@ -707,6 +711,68 @@ def validate_voice_auth(websocket: FastAPIWebSocket) -> bool:
     return incoming == expected
 
 
+def validate_control_auth_header(raw_header: str | None) -> bool:
+    expected = normalize_auth_token(CONFIG["CONTROL_WS_TOKEN"])
+    if not expected:
+        return True
+    incoming = normalize_auth_token(raw_header)
+    return incoming == expected
+
+
+def ensure_photo_dir() -> Path:
+    photo_dir = Path(CONFIG["PHOTO_SAVE_DIR"]).expanduser()
+    photo_dir.mkdir(parents=True, exist_ok=True)
+    return photo_dir
+
+
+def sanitize_photo_device_id(device_id: str) -> str:
+    safe_device_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", device_id).strip("._")
+    return safe_device_id or "unknown-device"
+
+
+def build_photo_output_path(device_id: str) -> Path:
+    photo_dir = ensure_photo_dir()
+    safe_device_id = sanitize_photo_device_id(device_id)
+    filename = f"photo_{safe_device_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
+    return photo_dir / filename
+
+
+def persist_photo_bytes(device_id: str, image_bytes: bytes) -> str:
+    if not image_bytes:
+        raise ValueError("empty image")
+    file_path = build_photo_output_path(device_id)
+    file_path.write_bytes(image_bytes)
+    return str(file_path)
+
+
+def decode_photo_b64_chunks(chunks: list[str]) -> bytes:
+    if not chunks:
+        raise ValueError("empty image")
+
+    image_bytes = bytearray()
+    for chunk in chunks:
+        image_bytes.extend(base64.b64decode(chunk, validate=True))
+    return bytes(image_bytes)
+
+
+def persist_photo_b64(device_id: str, b64_data: str) -> str:
+    image_bytes = base64.b64decode(b64_data, validate=True)
+    return persist_photo_bytes(device_id, image_bytes)
+
+
+async def interpret_uploaded_photo(device_id: str, image_bytes: bytes, prompt: str) -> tuple[str, str]:
+    file_path = persist_photo_bytes(device_id, image_bytes)
+    logger.info(
+        "[Vision] Interpreting uploaded photo from %s file=%s prompt_len=%d",
+        device_id,
+        file_path,
+        len(prompt),
+    )
+    b64_data = base64.b64encode(image_bytes).decode("ascii")
+    result = await interpret_image(b64_data, prompt)
+    return result, file_path
+
+
 def unwrap_audio_payload(protocol_version: int, payload: bytes) -> bytes:
     if protocol_version == 2:
         if len(payload) < 12:
@@ -971,16 +1037,11 @@ async def transcribe_audio_frames(opus_frames: list[bytes]) -> SttResult:
 
 async def text_to_speech_mp3_bytes(text: str) -> bytes:
     communicate = edge_tts.Communicate(text, CONFIG["VOICE_NAME"])
-    audio_data = b""
+    audio_data = bytearray()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
-            audio_data += chunk["data"]
-    return audio_data
-
-
-async def text_to_speech_b64(text: str) -> str:
-    audio_data = await text_to_speech_mp3_bytes(text)
-    return base64.b64encode(audio_data).decode("utf-8")
+            audio_data.extend(chunk["data"])
+    return bytes(audio_data)
 
 
 async def mp3_to_ogg_opus_bytes(mp3_bytes: bytes) -> bytes:
@@ -1020,10 +1081,10 @@ async def mp3_to_ogg_opus_bytes(mp3_bytes: bytes) -> bytes:
     return ogg_data
 
 
-async def text_to_speech_ogg_b64(text: str) -> str:
+async def prepare_tts_audio(text: str) -> list[bytes]:
     mp3_bytes = await text_to_speech_mp3_bytes(text)
     ogg_data = await mp3_to_ogg_opus_bytes(mp3_bytes)
-    return base64.b64encode(ogg_data).decode("utf-8")
+    return extract_ogg_opus_packets(ogg_data)
 
 
 def extract_ogg_opus_packets(ogg_data: bytes) -> list[bytes]:
@@ -1130,19 +1191,66 @@ async def interpret_image(image_b64: str, prompt: str) -> str:
         return data["choices"][0]["message"]["content"].strip()
 
 
-async def send_control_channel_tts(robot_id: str, text: str, emotion: int) -> None:
+def clear_session_audio_buffer(session: VoiceSession) -> None:
+    session.audio_frames.clear()
+    session.audio_frame_count = 0
+    session.audio_byte_count = 0
+
+
+def estimate_tts_playback_seconds(opus_packets: list[bytes]) -> float:
+    if not opus_packets:
+        return 1.0
+    return max(1.0, len(opus_packets) * CONFIG["TTS_FRAME_DURATION_MS"] / 1000.0)
+
+
+def arm_session_playback_guard(session: VoiceSession, duration_seconds: float) -> None:
+    guard_until = time.perf_counter() + max(0.0, duration_seconds)
+    session.playback_guard_until = max(session.playback_guard_until, guard_until)
+    session.listening_guard_until = max(session.listening_guard_until, session.playback_guard_until)
+    session.listening_guard_dropped_frames = 0
+
+
+async def send_control_channel_tts(
+    robot_id: str,
+    text: str,
+    emotion: int,
+    opus_packets: list[bytes] | None = None,
+) -> None:
     if robot_id not in connected_robots:
         return
-    audio_b64 = await text_to_speech_ogg_b64(text)
+
+    if opus_packets is None:
+        opus_packets = await prepare_tts_audio(text)
+
     await send_robot_message(
         robot_id,
         {
-            "type": "tts",
+            "type": "tts_stream_start",
             "text": text,
-            "audio": audio_b64,
             "emotion": emotion,
+            "sample_rate": CONFIG["TTS_SAMPLE_RATE"],
+            "frame_duration": CONFIG["TTS_FRAME_DURATION_MS"],
+            "packet_count": len(opus_packets),
         },
     )
+
+    for index, packet in enumerate(opus_packets):
+        await send_robot_message(
+            robot_id,
+            {
+                "type": "tts_stream_chunk",
+                "index": index,
+                "data": base64.b64encode(packet).decode("ascii"),
+            },
+        )
+
+    await send_robot_message(robot_id, {"type": "tts_stream_end"})
+
+
+async def send_control_channel_stop_tts(robot_id: str) -> None:
+    if robot_id not in connected_robots:
+        return
+    await send_robot_message(robot_id, {"type": "stop_tts"})
 
 
 def get_active_voice_session(robot_id: str) -> VoiceSession | None:
@@ -1208,9 +1316,7 @@ async def run_processing_task(session: VoiceSession) -> None:
         session.processing_task = None
 
 
-async def stream_native_tts_audio(session: VoiceSession, text: str) -> None:
-    mp3_bytes = await text_to_speech_mp3_bytes(text)
-    opus_packets = await mp3_to_opus_packets(mp3_bytes)
+async def stream_native_tts_audio(session: VoiceSession, opus_packets: list[bytes]) -> None:
     frame_delay = CONFIG["TTS_FRAME_DURATION_MS"] / 1000.0
 
     for packet in opus_packets:
@@ -1240,10 +1346,12 @@ async def stop_robot_speaking(robot_id: str) -> None:
     session = get_active_voice_session(robot_id)
     if session is not None:
         session.listening = False
-        session.audio_frames.clear()
+        session.playback_guard_until = 0.0
+        clear_session_audio_buffer(session)
         await cancel_session_tasks(session)
         await send_session_json(session, {"type": "tts", "state": "stop"})
         await reset_session_emotion(session)
+    await send_control_channel_stop_tts(robot_id)
 
 
 async def reset_session_emotion(session: VoiceSession) -> None:
@@ -1252,25 +1360,65 @@ async def reset_session_emotion(session: VoiceSession) -> None:
     await send_session_json(session, {"type": "llm", "emotion": "neutral", "text": ""})
 
 
+async def handle_tts_prepare_failure(
+    session: VoiceSession,
+    ai_text: str,
+    emotion_name: str,
+    exc: Exception,
+) -> None:
+    logger.exception("[Voice] TTS prepare failed for %s: %s", session.robot_id, exc)
+    if session.closed:
+        return
+
+    try:
+        message = ai_text.strip()
+        if message:
+            message = f"{message}\n{_TTS_PREPARE_FAILED_HINT}"
+        else:
+            message = _TTS_PREPARE_FAILED_HINT
+        await send_session_json(session, {"type": "llm", "emotion": emotion_name, "text": ""})
+        await send_session_json(session, {"type": "tts", "state": "sentence_start", "text": message})
+        await send_session_json(session, {"type": "tts", "state": "stop"})
+        await reset_session_emotion(session)
+    except RuntimeError:
+        logger.warning("[Voice] Session closed while reporting TTS prepare failure for %s", session.robot_id)
+
+
 async def run_tts_response(session: VoiceSession, ai_text: str, emotion_name: str, emotion_index: int) -> None:
+    opus_packets: list[bytes] = []
+    used_control_fallback = False
+
+    try:
+        await cancel_task(session.finalize_task)
+        session.finalize_task = None
+        clear_session_audio_buffer(session)
+        opus_packets = await prepare_tts_audio(ai_text)
+    except Exception as exc:
+        await handle_tts_prepare_failure(session, ai_text, emotion_name, exc)
+        return
+
     try:
         await send_session_json(session, {"type": "llm", "emotion": emotion_name, "text": ""})
         await send_session_json(session, {"type": "tts", "state": "start"})
         await send_session_json(session, {"type": "tts", "state": "sentence_start", "text": ai_text})
     except RuntimeError as exc:
         logger.warning("[Voice] Session already closed for %s, fallback to control channel: %s", session.robot_id, exc)
-        await send_control_channel_tts(session.robot_id, ai_text, emotion_index)
+        await send_control_channel_tts(session.robot_id, ai_text, emotion_index, opus_packets=opus_packets)
         return
 
     try:
-        await stream_native_tts_audio(session, ai_text)
+        await stream_native_tts_audio(session, opus_packets)
     except Exception as exc:
         logger.warning("[Voice] Native TTS failed for %s, fallback to control channel: %s", session.robot_id, exc)
-        await send_control_channel_tts(session.robot_id, ai_text, emotion_index)
+        used_control_fallback = True
+        clear_session_audio_buffer(session)
+        arm_session_playback_guard(session, estimate_tts_playback_seconds(opus_packets) + 0.8)
+        await send_control_channel_tts(session.robot_id, ai_text, emotion_index, opus_packets=opus_packets)
     finally:
         if not session.closed:
             await send_session_json(session, {"type": "tts", "state": "stop"})
-            await reset_session_emotion(session)
+            if not used_control_fallback:
+                await reset_session_emotion(session)
 
 
 async def process_voice_request(session: VoiceSession) -> None:
@@ -1375,7 +1523,7 @@ async def mcp__stackchan_action(
 
 @mcp.tool()
 async def mcp__stackchan_capture_photo(robot_id: Annotated[str, "机器人的唯一标识符。不填时使用 STACKCHAN_DEFAULT_ROBOT_ID"] = "") -> str:
-    """控制机器人拍照，将照片保存为本地文件并返回状态。"""
+    """控制机器人拍照，将照片保存到 VPS 本地文件并返回路径。"""
     robot_id, error = resolve_robot_id(robot_id)
     if error:
         return error
@@ -1395,22 +1543,20 @@ async def mcp__stackchan_capture_photo(robot_id: Annotated[str, "机器人的唯
     await send_robot_json(connected_robots[robot_id], {"type": "capture_photo"})
     
     try:
-        # 等待 60 秒，Base64 很大，加上网络延迟，给足时间
-        b64_data = await asyncio.wait_for(future, timeout=60.0)
-        
-        # 将图片保存到本地文件
-        img_data = base64.b64decode(b64_data)
-        photo_dir = CONFIG["PHOTO_SAVE_DIR"]
-        if not os.path.exists(photo_dir):
-            os.makedirs(photo_dir)
+        result = await asyncio.wait_for(future, timeout=60.0)
+        if isinstance(result, dict):
+            ok = bool(result.get("ok", False))
+            if ok:
+                path = str(result.get("path", ""))
+                return f"成功拍照并保存！文件路径: {path}"
+            message = str(result.get("message", "") or "拍照失败。")
+            return f"错误：{message}"
 
-        filename = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-        file_path = os.path.join(photo_dir, filename)
-        
-        with open(file_path, "wb") as f:
-            f.write(img_data)
-        
-        return f"成功拍照并保存！文件路径: {file_path} (数据大小: {len(img_data)} bytes)"
+        # 兼容旧固件：仍然接受 Base64 图片并在 VPS 侧落盘。
+        b64_data = str(result)
+        file_path = persist_photo_b64(robot_id, b64_data)
+        file_size = os.path.getsize(file_path)
+        return f"成功拍照并保存！文件路径: {file_path} (数据大小: {file_size} bytes)"
     except asyncio.TimeoutError:
         photo_futures.pop(robot_id, None)
         return "错误：拍照请求超时（机器人 60 秒内未回传图片数据）。"
@@ -1436,9 +1582,11 @@ async def mcp__stackchan_interpret_photo(
         old_f = interpret_futures.pop(robot_id)
         if not old_f.done():
             old_f.cancel()
+    interpret_requests.pop(robot_id, None)
 
     future = asyncio.get_event_loop().create_future()
     interpret_futures[robot_id] = future
+    interpret_requests[robot_id] = {"prompt": prompt}
     await send_robot_json(connected_robots[robot_id], {"type": "interpret_photo", "prompt": prompt})
     
     try:
@@ -1450,8 +1598,11 @@ async def mcp__stackchan_interpret_photo(
         return f"错误：{text or '视觉解读失败。'}"
     except asyncio.TimeoutError:
         interpret_futures.pop(robot_id, None)
+        interpret_requests.pop(robot_id, None)
         return "错误：拍照请求超时。"
     except Exception as e:
+        interpret_futures.pop(robot_id, None)
+        interpret_requests.pop(robot_id, None)
         return f"错误：视觉解读失败 - {str(e)}"
 
 
@@ -1557,43 +1708,6 @@ async def mcp__stackchan_status(
         "history_turns": len(robot_histories[robot_id]) // 2 if robot_id in robot_histories else 0,
     }
     return json.dumps(status, ensure_ascii=False)
-
-
-@mcp.tool()
-async def mcp__stackchan_update_config(
-    robot_id: Annotated[str, "机器人的唯一标识符。不填时使用 STACKCHAN_DEFAULT_ROBOT_ID"] = "",
-    url: Annotated[str, "旧链路用的新 API Base URL"] = "",
-    key: Annotated[str, "旧链路用的新 API Key"] = "",
-    model: Annotated[str, "旧链路用的新模型名称"] = "",
-    voice_ws_url: Annotated[str, "主语音协议 WebSocket URL，如 wss://example.com/ws"] = "",
-    voice_token: Annotated[str, "主语音协议 Token"] = "",
-    voice_version: Annotated[int, "主语音协议版本，通常填 1"] = -1,
-    use_custom: Annotated[bool, "是否使用自定义配置"] = True,
-    reboot: Annotated[bool, "是否重启生效"] = True,
-) -> str:
-    """更新机器人的配置，包括旧链路配置和主语音 WebSocket 配置。"""
-    robot_id, error = resolve_robot_id(robot_id)
-    if error:
-        return error
-    error = validate_robot_online(robot_id)
-    if error:
-        return error
-    payload = {
-        "type": "update_config",
-        "url": url if url else None,
-        "key": key if key else None,
-        "model": model if model else None,
-        "voice_ws_url": voice_ws_url if voice_ws_url else None,
-        "voice_token": voice_token if voice_token else None,
-        "voice_ws_version": voice_version if voice_version > 0 else None,
-        "use_custom": use_custom,
-        "reboot": reboot,
-    }
-    try:
-        await send_robot_message(robot_id, payload)
-        return f"Success: Config update sent to {robot_id}."
-    except Exception as exc:
-        return f"Error: {exc}"
 
 
 @mcp.tool()
@@ -1753,11 +1867,8 @@ async def vision_explain_handler(
     file: UploadFile = File(...),
     question: str = Form("请详细描述你看到的内容。"),
 ):
-    expected = normalize_auth_token(CONFIG["VOICE_WS_TOKEN"])
-    if expected:
-        incoming = normalize_auth_token(request.headers.get("authorization"))
-        if incoming != expected:
-            raise HTTPException(status_code=401, detail="unauthorized")
+    if not validate_control_auth_header(request.headers.get("authorization")):
+        raise HTTPException(status_code=401, detail="unauthorized")
 
     image_bytes = await file.read()
     if not image_bytes:
@@ -1769,9 +1880,54 @@ async def vision_explain_handler(
     return Response(content=result, media_type="text/plain; charset=utf-8")
 
 
+@app.post("/capture")
+async def capture_handler(
+    request: Request,
+    file: UploadFile = File(...),
+    question: str = Form(""),
+):
+    if not validate_control_auth_header(request.headers.get("authorization")):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    device_id = request.headers.get("device-id", "").strip() or "unknown-device"
+    safe_device_id = sanitize_photo_device_id(device_id)
+    file_path = build_photo_output_path(device_id)
+
+    total_bytes = 0
+    with file_path.open("wb") as output:
+        while True:
+            chunk = await file.read(8192)
+            if not chunk:
+                break
+            output.write(chunk)
+            total_bytes += len(chunk)
+
+    await file.close()
+
+    if total_bytes == 0:
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="empty image")
+
+    logger.info(
+        "[Vision] Capture endpoint saved device=%s file=%s size=%d ignored_question=%s",
+        safe_device_id,
+        file_path,
+        total_bytes,
+        bool(question),
+    )
+    return Response(content=str(file_path), media_type="text/plain; charset=utf-8")
+
 @app.websocket("/ws")
 async def main_voice_ws_handler(websocket: FastAPIWebSocket):
     if not validate_voice_auth(websocket):
+        logger.warning(
+            "[Voice] Auth failed: device_id=%s client_id=%s",
+            websocket.headers.get("device-id") or websocket.query_params.get("device_id") or "unknown-device",
+            websocket.headers.get("client-id") or "unknown-client",
+        )
         await websocket.close(code=4401)
         return
 
@@ -1795,10 +1951,29 @@ async def main_voice_ws_handler(websocket: FastAPIWebSocket):
 
             if message.get("text") is not None:
                 text = message["text"]
-                doc = json.loads(text)
+                try:
+                    doc = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "[Voice] Invalid JSON robot=%s client=%s error=%s raw=%r",
+                        session.robot_id,
+                        session.client_id,
+                        exc,
+                        text[:200],
+                    )
+                    continue
                 msg_type = doc.get("type", "")
 
                 if msg_type == "hello":
+                    logger.info(
+                        "[Voice] hello recv robot=%s client=%s version=%s transport=%s session_id=%s audio=%s",
+                        session.robot_id,
+                        session.client_id,
+                        doc.get("version"),
+                        doc.get("transport"),
+                        doc.get("session_id"),
+                        doc.get("audio_params"),
+                    )
                     if doc.get("session_id"):
                         session.session_id = doc["session_id"]
                     hello = {
@@ -1814,6 +1989,13 @@ async def main_voice_ws_handler(websocket: FastAPIWebSocket):
                             "frame_duration": CONFIG["TTS_FRAME_DURATION_MS"],
                         },
                     }
+                    logger.info(
+                        "[Voice] hello send robot=%s client=%s session_id=%s audio=%s",
+                        session.robot_id,
+                        session.client_id,
+                        hello["session_id"],
+                        hello["audio_params"],
+                    )
                     await send_session_json(session, hello)
                     await cancel_task(session.heartbeat_task)
                     session.heartbeat_task = asyncio.create_task(keep_voice_session_alive(session))
@@ -1835,12 +2017,9 @@ async def main_voice_ws_handler(websocket: FastAPIWebSocket):
                         session.processing_task = None
                         await cancel_task(session.finalize_task)
                         session.finalize_task = None
-                        session.audio_frames.clear()
-                        session.audio_frame_count = 0
-                        session.audio_byte_count = 0
-                        session.listening_guard_until = (
-                            time.perf_counter() + CONFIG["VOICE_LISTENING_GUARD_MS"] / 1000.0
-                        )
+                        clear_session_audio_buffer(session)
+                        guard_until = time.perf_counter() + CONFIG["VOICE_LISTENING_GUARD_MS"] / 1000.0
+                        session.listening_guard_until = max(guard_until, session.playback_guard_until)
                         session.listening_guard_dropped_frames = 0
                         session.listening = True
                     elif state == "stop":
@@ -1854,10 +2033,12 @@ async def main_voice_ws_handler(websocket: FastAPIWebSocket):
                 if msg_type == "abort":
                     if doc.get("session_id"):
                         session.session_id = doc["session_id"]
-                    session.audio_frames.clear()
+                    session.playback_guard_until = 0.0
+                    clear_session_audio_buffer(session)
                     session.listening = False
                     await cancel_session_tasks(session)
                     await send_session_json(session, {"type": "tts", "state": "stop"})
+                    await send_control_channel_stop_tts(session.robot_id)
                     continue
 
                 if msg_type == "ping":
@@ -1906,6 +2087,12 @@ async def main_voice_ws_handler(websocket: FastAPIWebSocket):
 
             if message.get("type") == "websocket.disconnect":
                 session.closed = True
+                logger.info(
+                    "[Voice] disconnect event robot=%s client=%s code=%s",
+                    session.robot_id,
+                    session.client_id,
+                    message.get("code"),
+                )
                 break
 
     except Exception as exc:
@@ -1915,6 +2102,15 @@ async def main_voice_ws_handler(websocket: FastAPIWebSocket):
         session.closed = True
         await cancel_session_tasks(session)
         voice_sessions.pop(client_id, None)
+        logger.info(
+            "[Voice] session closed robot=%s client=%s session_id=%s listening=%s frames=%d bytes=%d",
+            session.robot_id,
+            session.client_id,
+            session.session_id,
+            session.listening,
+            session.audio_frame_count,
+            session.audio_byte_count,
+        )
 
 
 # --- 6. StackChan App/Avatar WebSocket (/stackChan/ws) ---
@@ -1965,7 +2161,7 @@ async def process_robot_control_message(message: str, robot_socket: object) -> s
             return None
             
         # 校验 Token (可选，为了安全建议开启)
-        if token != CONFIG["VOICE_WS_TOKEN"]:
+        if not validate_control_auth_header(token):
             logger.warning("[WSS] Robot registration failed: Invalid token from %s", device_id)
             return None
 
@@ -1991,6 +2187,30 @@ async def process_robot_control_message(message: str, robot_socket: object) -> s
             future = photo_futures.pop(robot_id)
             if not future.done():
                 future.set_result(data.get("data"))
+
+    if msg_type == "photo_capture_result":
+        robot_id = None
+        for rid, sock in connected_robots.items():
+            if sock is robot_socket:
+                robot_id = rid
+                break
+
+        if robot_id and robot_id in photo_futures:
+            result = {
+                "ok": bool(data.get("ok", False)),
+                "path": str(data.get("path", "")),
+                "message": str(data.get("message", "")),
+            }
+            logger.info(
+                "[WSS] Capture result from %s ok=%s path=%s message_len=%d",
+                robot_id,
+                result["ok"],
+                result["path"],
+                len(result["message"]),
+            )
+            future = photo_futures.pop(robot_id)
+            if not future.done():
+                future.set_result(result)
 
     if msg_type == "photo_begin":
         robot_id = None
@@ -2026,18 +2246,54 @@ async def process_robot_control_message(message: str, robot_socket: object) -> s
                 robot_id = rid
                 break
 
-        if robot_id and robot_id in photo_futures:
-            upload = photo_uploads.pop(robot_id, None) or {"chunks": []}
-            b64_data = "".join(upload.get("chunks", []))
+        if robot_id:
+            upload = photo_uploads.pop(robot_id, None) or {"chunks": [], "total_chunks": 0}
+            chunks = list(upload.get("chunks", []))
+            chunk_count = len(chunks)
+            expected_chunks = int(data.get("total_chunks", 0) or upload.get("total_chunks", 0) or 0)
             logger.info(
-                "[WSS] Photo upload end from %s chunks=%d total_b64=%d",
+                "[WSS] Photo upload end from %s chunks=%d expected=%d total_b64=%d",
                 robot_id,
-                len(upload.get("chunks", [])),
-                len(b64_data),
+                chunk_count,
+                expected_chunks,
+                sum(len(chunk) for chunk in chunks),
             )
-            future = photo_futures.pop(robot_id)
-            if not future.done():
-                future.set_result(b64_data)
+            if expected_chunks and chunk_count != expected_chunks:
+                logger.warning(
+                    "[WSS] Photo chunk count mismatch from %s expected=%d got=%d",
+                    robot_id,
+                    expected_chunks,
+                    chunk_count,
+                )
+
+            if robot_id in photo_futures:
+                future = photo_futures.pop(robot_id)
+                if not future.done():
+                    try:
+                        image_bytes = decode_photo_b64_chunks(chunks)
+                        file_path = persist_photo_bytes(robot_id, image_bytes)
+                        future.set_result({"ok": True, "path": file_path, "message": ""})
+                    except Exception as exc:
+                        logger.exception("[WSS] Failed to persist photo from %s: %s", robot_id, exc)
+                        future.set_result({"ok": False, "path": "", "message": f"保存照片失败: {exc}"})
+            elif robot_id in interpret_futures:
+                future = interpret_futures.pop(robot_id)
+                request = interpret_requests.pop(robot_id, None) or {}
+                prompt = str(request.get("prompt", "") or "请详细描述你看到的内容。")
+                if not future.done():
+                    try:
+                        image_bytes = decode_photo_b64_chunks(chunks)
+                        text, file_path = await interpret_uploaded_photo(robot_id, image_bytes, prompt)
+                        logger.info(
+                            "[WSS] Interpret completed from %s file=%s text_len=%d",
+                            robot_id,
+                            file_path,
+                            len(text),
+                        )
+                        future.set_result({"ok": True, "text": text})
+                    except Exception as exc:
+                        logger.exception("[WSS] Failed to interpret uploaded photo from %s: %s", robot_id, exc)
+                        future.set_result({"ok": False, "text": f"视觉解读失败: {exc}"})
 
     if msg_type == "photo_interpret_result":
         robot_id = None
@@ -2051,6 +2307,7 @@ async def process_robot_control_message(message: str, robot_socket: object) -> s
                 "ok": bool(data.get("ok", False)),
                 "text": str(data.get("text", "")),
             }
+            interpret_requests.pop(robot_id, None)
             logger.info(
                 "[WSS] Interpret result from %s ok=%s text_len=%d",
                 robot_id,
@@ -2076,7 +2333,13 @@ async def robot_ws_handler(websocket):
         if device_id in connected_robots and connected_robots.get(device_id) is websocket:
             del connected_robots[device_id]
         photo_uploads.pop(device_id, None)
-        interpret_futures.pop(device_id, None)
+        future = photo_futures.pop(device_id, None)
+        if future and not future.done():
+            future.cancel()
+        future = interpret_futures.pop(device_id, None)
+        if future and not future.done():
+            future.cancel()
+        interpret_requests.pop(device_id, None)
 
 
 @app.websocket("/robot-wss")
@@ -2100,7 +2363,13 @@ async def robot_ws_handler_http(websocket: FastAPIWebSocket):
         if device_id in connected_robots and connected_robots.get(device_id) is websocket:
             del connected_robots[device_id]
         photo_uploads.pop(device_id, None)
-        interpret_futures.pop(device_id, None)
+        future = photo_futures.pop(device_id, None)
+        if future and not future.done():
+            future.cancel()
+        future = interpret_futures.pop(device_id, None)
+        if future and not future.done():
+            future.cancel()
+        interpret_requests.pop(device_id, None)
 
 
 # --- 8. 系统启动 ---

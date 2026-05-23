@@ -11,6 +11,7 @@
 #include "assets/lang_config.h"
 
 #define TAG "WS"
+#define WEBSOCKET_CONNECT_MAX_ATTEMPTS 3
 
 WebsocketProtocol::WebsocketProtocol() {
     event_group_handle_ = xEventGroupCreate();
@@ -91,18 +92,42 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     error_occurred_ = false;
 
-    auto network = Board::GetInstance().GetNetwork();
-    websocket_ = network->CreateWebSocket(1);
-    if (websocket_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to create websocket");
-        return false;
-    }
-
     if (!token.empty()) {
         // If token not has a space, add "Bearer " prefix
         if (token.find(" ") == std::string::npos) {
             token = "Bearer " + token;
         }
+    }
+
+    for (int attempt = 1; attempt <= WEBSOCKET_CONNECT_MAX_ATTEMPTS; ++attempt) {
+        if (OpenAudioChannelOnce(url, token, attempt, WEBSOCKET_CONNECT_MAX_ATTEMPTS)) {
+            return true;
+        }
+        if (attempt < WEBSOCKET_CONNECT_MAX_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(500 * attempt));
+        }
+    }
+
+    return false;
+}
+
+bool WebsocketProtocol::OpenAudioChannelOnce(const std::string& url, const std::string& token, int attempt, int max_attempts) {
+    auto network = Board::GetInstance().GetNetwork();
+    xEventGroupClearBits(event_group_handle_,
+        WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT | WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED);
+    websocket_.reset();
+    session_id_.clear();
+
+    websocket_ = network->CreateWebSocket(5);
+    if (websocket_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create websocket");
+        if (attempt == max_attempts) {
+            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        }
+        return false;
+    }
+
+    if (!token.empty()) {
         websocket_->SetHeader("Authorization", token.c_str());
     }
     websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
@@ -148,6 +173,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
         } else {
             // Parse JSON data
             auto root = cJSON_ParseWithLength(data, len);
+            if (root == nullptr) {
+                ESP_LOGE(TAG, "Failed to parse websocket JSON: %.*s", (int)len, data);
+                return;
+            }
             auto type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type)) {
                 if (strcmp(type->valuestring, "hello") == 0) {
@@ -166,32 +195,73 @@ bool WebsocketProtocol::OpenAudioChannel() {
     });
 
     websocket_->OnDisconnected([this]() {
-        ESP_LOGI(TAG, "Websocket disconnected");
+        ESP_LOGW(TAG,
+            "Websocket disconnected: session_id=%s error=%d connected=%d",
+            session_id_.c_str(),
+            error_occurred_ ? 1 : 0,
+            (websocket_ != nullptr && websocket_->IsConnected()) ? 1 : 0);
+        if (on_disconnected_ != nullptr) {
+            on_disconnected_();
+        }
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
         }
     });
 
-    ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
+    ESP_LOGI(TAG, "Connecting to websocket server (attempt %d/%d): %s with version: %d",
+        attempt, max_attempts, url.c_str(), version_);
     if (!websocket_->Connect(url.c_str())) {
         ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
-        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        websocket_.reset();
+        if (attempt == max_attempts) {
+            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        }
         return false;
     }
 
     // Send hello message to describe the client
     auto message = GetHelloMessage();
-    if (!SendText(message)) {
+    if (!websocket_->Send(message)) {
+        ESP_LOGE(TAG, "Failed to send hello to websocket server");
+        websocket_.reset();
+        if (attempt == max_attempts) {
+            SetError(Lang::Strings::SERVER_ERROR);
+        }
         return false;
     }
+    ESP_LOGI(TAG,
+        "Client hello sent: attempt=%d/%d version=%d payload_len=%u",
+        attempt,
+        max_attempts,
+        version_,
+        static_cast<unsigned>(message.size()));
 
-    // Wait for server hello
-    EventBits_t bits = xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+    // Wait for server hello or an explicit hello parse failure.
+    EventBits_t bits = xEventGroupWaitBits(
+        event_group_handle_,
+        WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT | WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED,
+        pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
+    if (bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED) {
+        ESP_LOGE(TAG, "Received invalid server hello");
+        websocket_.reset();
+        if (attempt == max_attempts) {
+            SetError(Lang::Strings::SERVER_ERROR);
+        }
+        return false;
+    }
     if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT)) {
         ESP_LOGE(TAG, "Failed to receive server hello");
-        SetError(Lang::Strings::SERVER_TIMEOUT);
+        websocket_.reset();
+        if (attempt == max_attempts) {
+            SetError(Lang::Strings::SERVER_TIMEOUT);
+        }
         return false;
     }
+    ESP_LOGI(TAG,
+        "Server hello accepted: session_id=%s sample_rate=%d frame_ms=%d",
+        session_id_.c_str(),
+        server_sample_rate_,
+        server_frame_duration_);
 
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();
@@ -227,8 +297,14 @@ std::string WebsocketProtocol::GetHelloMessage() {
 
 void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "websocket") != 0) {
+    if (!cJSON_IsString(transport)) {
+        ESP_LOGE(TAG, "Server hello missing transport");
+        xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED);
+        return;
+    }
+    if (strcmp(transport->valuestring, "websocket") != 0) {
         ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+        xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED);
         return;
     }
 
@@ -236,6 +312,10 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     if (cJSON_IsString(session_id)) {
         session_id_ = session_id->valuestring;
         ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
+    } else {
+        ESP_LOGE(TAG, "Server hello missing session_id");
+        xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED);
+        return;
     }
 
     auto audio_params = cJSON_GetObjectItem(root, "audio_params");

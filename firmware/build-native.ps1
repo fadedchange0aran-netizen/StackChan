@@ -114,6 +114,14 @@ if (Test-Path $IdfExportEnv) {
 $IdfPath = Resolve-FirstExistingPath @($env:IDF_PATH, $DefaultIdfPath)
 if (-not $IdfPath) { throw "ESP-IDF not found. Please set IDF_PATH or update build-native.ps1 for your local environment." }
 
+$RomElfDir = Resolve-FirstExistingPath @(
+    $env:ESP_ROM_ELF_DIR,
+    $(Get-LatestDirectoryPath (Join-Path $EspressifToolRoot "esp-rom-elfs"))
+)
+if ($RomElfDir) {
+    $env:ESP_ROM_ELF_DIR = $RomElfDir
+}
+
 $PythonEnvRoot = Resolve-FirstExistingPath @($env:IDF_PYTHON_ENV_PATH, $DefaultPythonEnv)
 $PythonCommand = Get-Command python -ErrorAction SilentlyContinue
 $PythonExe = Resolve-FirstExistingPath @(

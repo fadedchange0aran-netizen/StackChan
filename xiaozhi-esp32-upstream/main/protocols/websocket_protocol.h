@@ -9,6 +9,7 @@
 #include <freertos/event_groups.h>
 
 #define WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
+#define WEBSOCKET_PROTOCOL_SERVER_HELLO_FAILED (1 << 1)
 
 class WebsocketProtocol : public Protocol {
 public:
@@ -27,6 +28,7 @@ private:
     int version_ = 1;
 
     void ParseServerHello(const cJSON* root);
+    bool OpenAudioChannelOnce(const std::string& url, const std::string& token, int attempt, int max_attempts);
     bool SendText(const std::string& text) override;
     std::string GetHelloMessage();
 };

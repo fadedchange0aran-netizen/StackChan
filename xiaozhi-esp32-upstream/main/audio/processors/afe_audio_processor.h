@@ -19,7 +19,7 @@ public:
     AfeAudioProcessor();
     ~AfeAudioProcessor();
 
-    void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
+    bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
     void Feed(std::vector<int16_t>&& data) override;
     void Start() override;
     void Stop() override;
@@ -33,6 +33,9 @@ private:
     EventGroupHandle_t event_group_ = nullptr;
     const esp_afe_sr_iface_t* afe_iface_ = nullptr;
     esp_afe_sr_data_t* afe_data_ = nullptr;
+    TaskHandle_t audio_task_handle_ = nullptr;
+    StackType_t* audio_task_stack_ = nullptr;
+    StaticTask_t* audio_task_buffer_ = nullptr;
     std::function<void(std::vector<int16_t>&& data)> output_callback_;
     std::function<void(bool speaking)> vad_state_change_callback_;
     AudioCodec* codec_ = nullptr;

@@ -10,6 +10,8 @@ class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
     bool in_config_mode_ = false;
+    bool has_connected_once_ = false;
+    bool allow_config_mode_on_connect_timeout_ = true;
     NetworkEventCallback network_event_callback_ = nullptr;
 
     virtual std::string GetBoardJson() override;

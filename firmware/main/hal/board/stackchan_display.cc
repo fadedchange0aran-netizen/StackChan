@@ -6,6 +6,7 @@
 #include "stackchan_display.h"
 #include <esp_log.h>
 #include <esp_err.h>
+#include <esp_timer.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
 #include <vector>
@@ -371,7 +372,14 @@ void StackChanAvatarDisplay::SetupUI()
     auto avatar = std::make_unique<DefaultAvatar>();
     avatar->init(lv_screen_active());
     avatar->getPanel()->onClick().connect([]() {
-        if (hal_bridge::is_xiaozhi_ready()) {
+        bool is_ready = hal_bridge::is_xiaozhi_ready();
+        bool is_idle = hal_bridge::is_xiaozhi_idle();
+        ESP_LOGI(TAG,
+                 "Avatar panel clicked: ready=%d idle=%d ts_us=%lld",
+                 is_ready ? 1 : 0,
+                 is_idle ? 1 : 0,
+                 static_cast<long long>(esp_timer_get_time()));
+        if (is_ready) {
             hal_bridge::toggle_xiaozhi_chat_state();
         }
     });

@@ -37,7 +37,7 @@
  */
 
 #define OPUS_FRAME_DURATION_MS 60
-#define MAX_ENCODE_TASKS_IN_QUEUE 2
+#define MAX_ENCODE_TASKS_IN_QUEUE 4
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
@@ -179,6 +179,9 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    uint32_t dropped_encode_frames_ = 0;
+    size_t max_send_queue_depth_ = 0;
+    int64_t last_backpressure_log_us_ = 0;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
@@ -188,6 +191,8 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    bool DropOldestSendEncodeTaskLocked();
+    void MaybeLogEncodeBackpressureLocked(const char* reason);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
 };

@@ -59,6 +59,11 @@
 
 #define TAG "StackChanCamera"
 
+static constexpr uint8_t kExplainJpegQuality = 60;
+static constexpr size_t kExplainJpegQueueDepth = 12;
+static constexpr TickType_t kExplainQueueSendTimeout = pdMS_TO_TICKS(500);
+static constexpr TickType_t kExplainQueueReceiveTimeout = pdMS_TO_TICKS(2000);
+
 #if defined(CONFIG_CAMERA_SENSOR_SWAP_PIXEL_BYTE_ORDER) || defined(CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP)
 #warning \
     "CAMERA_SENSOR_SWAP_PIXEL_BYTE_ORDER or CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP is enabled, which may cause image corruption in YUV422 format!"
@@ -100,6 +105,13 @@ static void log_available_video_devices()
 #else
 #define CAM_PRINT_FOURCC(pixelformat) (void)0;
 #endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_DEBUG_MODE
+
+static uint8_t choose_explain_jpeg_quality()
+{
+    // Avoid PMIC/I2C reads inside the capture path. A transient I2C timeout
+    // should not reboot the device while we are only choosing JPEG quality.
+    return kExplainJpegQuality;
+}
 
 StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 {
@@ -403,13 +415,9 @@ bool StackChanCamera::Capture()
         return false;
     }
 
-    // Launcher mode does not run the xiaozhi audio service, so the shutter sfx
-    // must be skipped there to avoid crashing through Application::PlaySound().
-    if (GetHAL().isXiaozhiRunning()) {
-        hal_bridge::app_play_sound(OGG_CAMERA_SHUTTER);
-    } else {
-        ESP_LOGI(TAG, "Skip shutter sound in launcher mode");
-    }
+    // Skip the shutter sfx during capture to reduce audio contention and avoid
+    // pulling extra resources into an already memory-sensitive path.
+    ESP_LOGI(TAG, "Skip shutter sound during capture");
 
     for (int i = 0; i < 3; i++) {
         struct v4l2_buffer buf = {};
@@ -1036,47 +1044,52 @@ std::string StackChanCamera::Explain(const std::string& question)
         throw std::runtime_error("Image explain URL or token is not set");
     }
 
-    // 创建局部的 JPEG 队列, 40 entries is about to store 512 * 40 = 20480 bytes of JPEG data
-    QueueHandle_t jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
+    const uint8_t jpeg_quality = choose_explain_jpeg_quality();
+
+    auto log_memory_state = [](const char* stage) {
+        ESP_LOGI(TAG, "[Explain] %s internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u",
+                 stage,
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+    };
+    auto drain_jpeg_queue = [](QueueHandle_t queue) {
+        if (queue == nullptr) {
+            return;
+        }
+        while (true) {
+            JpegChunk chunk{};
+            if (xQueueReceive(queue, &chunk, kExplainQueueReceiveTimeout) != pdPASS) {
+                break;
+            }
+            if (chunk.data != nullptr) {
+                heap_caps_free(chunk.data);
+            } else {
+                break;
+            }
+        }
+    };
+
+    log_memory_state("start");
+
+    // 保持一个较小的队列，避免网络变慢时积压过多 JPEG chunk。
+    QueueHandle_t jpeg_queue = xQueueCreate(kExplainJpegQueueDepth, sizeof(JpegChunk));
     if (jpeg_queue == nullptr) {
         ESP_LOGE(TAG, "Failed to create JPEG queue");
         throw std::runtime_error("Failed to create JPEG queue");
     }
 
-    // We spawn a thread to encode the image to JPEG using optimized encoder (cost about 500ms and 8KB SRAM)
-    encoder_thread_ = std::thread([this, jpeg_queue]() {
-        uint16_t w             = frame_.width ? frame_.width : 320;
-        uint16_t h             = frame_.height ? frame_.height : 240;
-        v4l2_pix_fmt_t enc_fmt = frame_.format;
-        bool ok                = image_to_jpeg_cb(
-                           frame_.data, frame_.len, w, h, enc_fmt, 80,
-                           [](void* arg, size_t index, const void* data, size_t len) -> size_t {
-                auto jpeg_queue = static_cast<QueueHandle_t>(arg);
-                JpegChunk chunk = {.data = nullptr, .len = len};
-                if (index == 0 && data != nullptr && len > 0) {
-                    chunk.data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    if (chunk.data == nullptr) {
-                        ESP_LOGE(TAG, "Failed to allocate %zu bytes for JPEG chunk", len);
-                        chunk.len = 0;
-                    } else {
-                        memcpy(chunk.data, data, len);
-                    }
-                } else {
-                    chunk.len = 0;  // Sentinel or error
-                }
-                xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
-                return len;
-                           },
-                           jpeg_queue);
-
-        if (!ok) {
-            JpegChunk chunk = {.data = nullptr, .len = 0};
-            xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
-        }
-    });
-
     auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        vQueueDelete(jpeg_queue);
+        throw std::runtime_error("Network is not ready");
+    }
     auto http    = network->CreateHttp(3);
+    if (http == nullptr) {
+        vQueueDelete(jpeg_queue);
+        throw std::runtime_error("Failed to create HTTP client");
+    }
     // 构造multipart/form-data请求体
     std::string boundary = "----ESP32_CAMERA_BOUNDARY";
 
@@ -1090,19 +1103,10 @@ std::string StackChanCamera::Explain(const std::string& question)
     http->SetHeader("Transfer-Encoding", "chunked");
     if (!http->Open("POST", explain_url_)) {
         ESP_LOGE(TAG, "Failed to connect to explain URL");
-        // Clear the queue
-        encoder_thread_.join();
-        JpegChunk chunk;
-        while (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) == pdPASS) {
-            if (chunk.data != nullptr) {
-                heap_caps_free(chunk.data);
-            } else {
-                break;
-            }
-        }
         vQueueDelete(jpeg_queue);
         throw std::runtime_error("Failed to connect to explain URL");
     }
+    log_memory_state("after_open");
 
     {
         // 第一块：question字段
@@ -1123,13 +1127,50 @@ std::string StackChanCamera::Explain(const std::string& question)
         http->Write(file_header.c_str(), file_header.size());
     }
 
+    // Delay JPEG encoding until after TLS is connected so the encoder's SRAM
+    // working set does not overlap with the handshake peak.
+    encoder_thread_ = std::thread([this, jpeg_queue, jpeg_quality]() {
+        uint16_t w             = frame_.width ? frame_.width : 320;
+        uint16_t h             = frame_.height ? frame_.height : 240;
+        v4l2_pix_fmt_t enc_fmt = frame_.format;
+        bool ok                = image_to_jpeg_cb(
+                           frame_.data, frame_.len, w, h, enc_fmt, jpeg_quality,
+                           [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+                auto jpeg_queue = static_cast<QueueHandle_t>(arg);
+                JpegChunk chunk = {.data = nullptr, .len = len};
+                if (data != nullptr && len > 0) {
+                    chunk.data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    if (chunk.data == nullptr) {
+                        ESP_LOGE(TAG, "Failed to allocate %zu bytes for JPEG chunk %u", len, static_cast<unsigned>(index));
+                        return 0; // Stop encoding on allocation failure
+                    }
+                    memcpy(chunk.data, data, len);
+                }
+
+                if (xQueueSend(jpeg_queue, &chunk, kExplainQueueSendTimeout) != pdPASS) {
+                    ESP_LOGE(TAG, "Failed to send JPEG chunk to queue");
+                    if (chunk.data) heap_caps_free(chunk.data);
+                    return 0; // Stop encoding if queue is blocked
+                }
+                return len;
+                           },
+                           jpeg_queue);
+
+        if (!ok) {
+            ESP_LOGE(TAG, "image_to_jpeg_cb failed");
+        }
+        // Always send a terminator chunk unless the queue is totally broken
+        JpegChunk terminator = {.data = nullptr, .len = 0};
+        xQueueSend(jpeg_queue, &terminator, kExplainQueueSendTimeout);
+    });
+
     // 第三块：JPEG数据
     size_t total_sent   = 0;
     bool saw_terminator = false;
     while (true) {
         JpegChunk chunk;
-        if (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to receive JPEG chunk");
+        if (xQueueReceive(jpeg_queue, &chunk, kExplainQueueReceiveTimeout) != pdPASS) {
+            ESP_LOGE(TAG, "Timed out waiting for JPEG chunk");
             break;
         }
         if (chunk.data == nullptr) {
@@ -1147,6 +1188,7 @@ std::string StackChanCamera::Explain(const std::string& question)
 
     if (!saw_terminator || total_sent == 0) {
         ESP_LOGE(TAG, "JPEG encoder failed or produced empty output");
+        http->Close();
         throw std::runtime_error("Failed to encode image to JPEG");
     }
 
@@ -1161,15 +1203,17 @@ std::string StackChanCamera::Explain(const std::string& question)
 
     if (http->GetStatusCode() != 200) {
         ESP_LOGE(TAG, "Failed to upload photo, status code: %d", http->GetStatusCode());
+        http->Close();
         throw std::runtime_error("Failed to upload photo");
     }
 
     std::string result = http->ReadAll();
     http->Close();
+    log_memory_state("end");
 
     // Get remain task stack size
     size_t remain_stack_size = uxTaskGetStackHighWaterMark(nullptr);
-    ESP_LOGI(TAG, "Explain image size=%d bytes, compressed size=%d, remain stack size=%d, question=%s\n%s",
-             (int)frame_.len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+    ESP_LOGI(TAG, "Explain image size=%d bytes, compressed size=%d, quality=%d, remain stack size=%d, question=%s\n%s",
+             (int)frame_.len, (int)total_sent, (int)jpeg_quality, (int)remain_stack_size, question.c_str(), result.c_str());
     return result;
 }

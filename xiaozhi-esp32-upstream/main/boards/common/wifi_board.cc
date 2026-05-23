@@ -91,9 +91,21 @@ void WifiBoard::TryWifiConnect() {
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {
-        // Start connection attempt with timeout
-        ESP_LOGI(TAG, "Starting WiFi connection attempt");
-        esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
+        // Only the initial boot attempt and a post-provisioning validation attempt
+        // are allowed to fall back into config mode on timeout.
+        if (!has_connected_once_) {
+            allow_config_mode_on_connect_timeout_ = true;
+        }
+
+        ESP_LOGI(TAG, "Starting WiFi connection attempt (allow_config_mode_on_timeout=%s, has_connected_once=%s)",
+            allow_config_mode_on_connect_timeout_ ? "true" : "false",
+            has_connected_once_ ? "true" : "false");
+        if (connect_timer_) {
+            esp_timer_stop(connect_timer_);
+        }
+        if (allow_config_mode_on_connect_timeout_) {
+            esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
+        }
         WifiManager::GetInstance().StartStation();
     } else {
         // No SSID configured, enter config mode
@@ -113,6 +125,8 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             Blufi::GetInstance().deinit();
 #endif
             in_config_mode_ = false;
+            has_connected_once_ = true;
+            allow_config_mode_on_connect_timeout_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
             break;
         case NetworkEvent::Scanning:
@@ -122,15 +136,24 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             ESP_LOGI(TAG, "WiFi connecting to %s", data.c_str());
             break;
         case NetworkEvent::Disconnected:
+            if (has_connected_once_) {
+                // Runtime disconnects should stay in station mode and let the WiFi
+                // stack handle reconnection instead of being forced back to provisioning.
+                esp_timer_stop(connect_timer_);
+                allow_config_mode_on_connect_timeout_ = false;
+            }
             ESP_LOGW(TAG, "WiFi disconnected");
             break;
         case NetworkEvent::WifiConfigModeEnter:
+            esp_timer_stop(connect_timer_);
+            allow_config_mode_on_connect_timeout_ = false;
             ESP_LOGI(TAG, "WiFi config mode entered");
             in_config_mode_ = true;
             break;
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
             in_config_mode_ = false;
+            allow_config_mode_on_connect_timeout_ = true;
             // Try to connect with the new credentials
             TryWifiConnect();
             break;
@@ -150,13 +173,31 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
+    auto& wifi_manager = WifiManager::GetInstance();
+
+    if (!board->allow_config_mode_on_connect_timeout_) {
+        ESP_LOGW(TAG, "Ignoring WiFi connection timeout because fallback to config mode is not allowed for the current attempt");
+        return;
+    }
+    if (wifi_manager.IsConnected()) {
+        ESP_LOGW(TAG, "Ignoring stale WiFi connection timeout because station is already connected");
+        return;
+    }
+    if (wifi_manager.IsConfigMode() || board->in_config_mode_) {
+        ESP_LOGW(TAG, "Ignoring stale WiFi connection timeout because config mode is already active");
+        return;
+    }
+
     ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
 
-    WifiManager::GetInstance().StopStation();
+    board->allow_config_mode_on_connect_timeout_ = false;
+    wifi_manager.StopStation();
     board->StartWifiConfigMode();
 }
 
 void WifiBoard::StartWifiConfigMode() {
+    esp_timer_stop(connect_timer_);
+    allow_config_mode_on_connect_timeout_ = false;
     in_config_mode_ = true;
     // Transition to wifi configuring state
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);

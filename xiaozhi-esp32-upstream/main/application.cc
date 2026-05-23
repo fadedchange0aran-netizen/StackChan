@@ -12,12 +12,26 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
 #define TAG "Application"
+
+static const char* PendingAudioActionToString(PendingAudioAction action) {
+    switch (action) {
+        case kPendingAudioActionNone:
+            return "none";
+        case kPendingAudioActionStartListening:
+            return "start_listening";
+        case kPendingAudioActionWakeWordInvoke:
+            return "wake_word_invoke";
+        default:
+            return "unknown";
+    }
+}
 
 
 Application::Application() {
@@ -219,7 +233,24 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                uint32_t packet_timestamp = packet->timestamp;
+                int packet_sample_rate = packet->sample_rate;
+                int packet_frame_duration = packet->frame_duration;
+                size_t packet_payload_size = packet->payload.size();
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                    static int64_t s_last_send_audio_fail_log_us = 0;
+                    int64_t now_us = esp_timer_get_time();
+                    if ((now_us - s_last_send_audio_fail_log_us) >= 1000 * 1000LL) {
+                        s_last_send_audio_fail_log_us = now_us;
+                        ESP_LOGW(TAG,
+                            "SendAudio returned false: state=%s channel_open=%d ts=%lu sample_rate=%d frame_ms=%d payload=%u",
+                            DeviceStateMachine::GetStateName(GetDeviceState()),
+                            protocol_ ? protocol_->IsAudioChannelOpened() : 0,
+                            static_cast<unsigned long>(packet_timestamp),
+                            packet_sample_rate,
+                            packet_frame_duration,
+                            static_cast<unsigned>(packet_payload_size));
+                    }
                     break;
                 }
             }
@@ -662,19 +693,32 @@ void Application::DismissAlert() {
 }
 
 void Application::ToggleChatState() {
+    ESP_LOGI(TAG,
+        "ToggleChatState requested: state=%s ts_us=%lld",
+        DeviceStateMachine::GetStateName(GetDeviceState()),
+        static_cast<long long>(esp_timer_get_time()));
     xEventGroupSetBits(event_group_, MAIN_EVENT_TOGGLE_CHAT);
 }
 
 void Application::StartListening() {
+    ESP_LOGI(TAG,
+        "StartListening requested: state=%s ts_us=%lld",
+        DeviceStateMachine::GetStateName(GetDeviceState()),
+        static_cast<long long>(esp_timer_get_time()));
     xEventGroupSetBits(event_group_, MAIN_EVENT_START_LISTENING);
 }
 
 void Application::StopListening() {
+    ESP_LOGI(TAG,
+        "StopListening requested: state=%s ts_us=%lld",
+        DeviceStateMachine::GetStateName(GetDeviceState()),
+        static_cast<long long>(esp_timer_get_time()));
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
 }
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
+    ESP_LOGI(TAG, "HandleToggleChatEvent: state=%s", DeviceStateMachine::GetStateName(state));
     
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -697,17 +741,20 @@ void Application::HandleToggleChatEvent() {
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
+            SetPendingStartListening(mode, false);
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
-            Schedule([this, mode]() {
-                ContinueOpenAudioChannel(mode);
+            Schedule([this]() {
+                ProcessPendingAudioAction();
             });
             return;
         }
+        ClearPendingAudioAction();
         SetListeningMode(mode);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
+        ClearPendingAudioAction();
         protocol_->CloseAudioChannel();
     }
 }
@@ -718,17 +765,111 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
         return;
     }
 
+    SetPendingStartListening(mode, false);
+    ProcessPendingAudioAction();
+}
+
+void Application::ClearPendingAudioAction() {
+    pending_audio_action_ = kPendingAudioActionNone;
+    pending_listening_mode_ = kListeningModeAutoStop;
+    pending_wake_word_.clear();
+    pending_play_popup_on_listening_ = false;
+}
+
+void Application::SetPendingStartListening(ListeningMode mode, bool play_popup) {
+    pending_audio_action_ = kPendingAudioActionStartListening;
+    pending_listening_mode_ = mode;
+    pending_wake_word_.clear();
+    pending_play_popup_on_listening_ = play_popup;
+}
+
+void Application::SetPendingWakeWordInvoke(const std::string& wake_word) {
+    pending_audio_action_ = kPendingAudioActionWakeWordInvoke;
+    pending_listening_mode_ = GetDefaultListeningMode();
+    pending_wake_word_ = wake_word;
+    pending_play_popup_on_listening_ = true;
+}
+
+void Application::ProcessPendingAudioAction() {
+    auto state = GetDeviceState();
+    bool can_use_existing_channel = state == kDeviceStateIdle && protocol_ != nullptr && protocol_->IsAudioChannelOpened();
+    ESP_LOGI(TAG,
+        "ProcessPendingAudioAction enter: state=%s action=%s pending_mode=%d popup=%d channel_open=%d can_use_existing=%d",
+        DeviceStateMachine::GetStateName(state),
+        PendingAudioActionToString(pending_audio_action_),
+        static_cast<int>(pending_listening_mode_),
+        pending_play_popup_on_listening_ ? 1 : 0,
+        (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) ? 1 : 0,
+        can_use_existing_channel ? 1 : 0);
+    if (state != kDeviceStateConnecting && !can_use_existing_channel) {
+        ESP_LOGW(TAG,
+            "ProcessPendingAudioAction ignored: state=%s action=%s",
+            DeviceStateMachine::GetStateName(state),
+            PendingAudioActionToString(pending_audio_action_));
+        return;
+    }
+
+    if (pending_audio_action_ == kPendingAudioActionNone) {
+        pending_listening_mode_ = GetDefaultListeningMode();
+        pending_audio_action_ = kPendingAudioActionStartListening;
+    }
+
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            ESP_LOGW(TAG,
+                "ProcessPendingAudioAction open channel failed: action=%s state=%s",
+                PendingAudioActionToString(pending_audio_action_),
+                DeviceStateMachine::GetStateName(GetDeviceState()));
+            if (pending_audio_action_ == kPendingAudioActionWakeWordInvoke) {
+                audio_service_.EnableWakeWordDetection(true);
+            }
+            ClearPendingAudioAction();
             return;
         }
     }
 
+    if (pending_audio_action_ == kPendingAudioActionWakeWordInvoke) {
+        auto wake_word = pending_wake_word_;
+        ClearPendingAudioAction();
+        ESP_LOGI(TAG,
+            "ProcessPendingAudioAction wake word path: wake_word=%s channel_open=%d",
+            wake_word.c_str(),
+            (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) ? 1 : 0);
+        ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+#if CONFIG_SEND_WAKE_WORD_DATA
+        // Encode and send the wake word data to the server
+        while (auto packet = audio_service_.PopWakeWordPacket()) {
+            protocol_->SendAudio(std::move(packet));
+        }
+        // Set the chat state to wake word detected
+        protocol_->SendWakeWordDetected(wake_word);
+        SetListeningMode(GetDefaultListeningMode());
+#else
+        // Set flag to play popup sound after state changes to listening
+        // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
+        play_popup_on_listening_ = true;
+        SetListeningMode(GetDefaultListeningMode());
+#endif
+        return;
+    }
+
+    bool play_popup = pending_play_popup_on_listening_;
+    ListeningMode mode = pending_listening_mode_;
+    ClearPendingAudioAction();
+    if (play_popup) {
+        play_popup_on_listening_ = true;
+    }
+    ESP_LOGI(TAG,
+        "ProcessPendingAudioAction exit to listening: mode=%d popup=%d channel_open=%d",
+        static_cast<int>(mode),
+        play_popup_on_listening_ ? 1 : 0,
+        (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) ? 1 : 0);
     SetListeningMode(mode);
 }
 
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
+    ESP_LOGI(TAG, "HandleStartListeningEvent: state=%s", DeviceStateMachine::GetStateName(state));
     
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -746,16 +887,19 @@ void Application::HandleStartListeningEvent() {
     
     if (state == kDeviceStateIdle) {
         if (!protocol_->IsAudioChannelOpened()) {
+            SetPendingStartListening(kListeningModeManualStop, false);
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
             Schedule([this]() {
-                ContinueOpenAudioChannel(kListeningModeManualStop);
+                ProcessPendingAudioAction();
             });
             return;
         }
+        ClearPendingAudioAction();
         SetListeningMode(kListeningModeManualStop);
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
+        ClearPendingAudioAction();
         SetListeningMode(kListeningModeManualStop);
     }
 }
@@ -771,6 +915,7 @@ void Application::HandleStopListeningEvent() {
         if (protocol_) {
             protocol_->SendStopListening();
         }
+        ClearPendingAudioAction();
         SetDeviceState(kDeviceStateIdle);
     }
 }
@@ -785,20 +930,29 @@ void Application::HandleWakeWordDetectedEvent() {
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
     if (state == kDeviceStateIdle) {
+#if CONFIG_SEND_WAKE_WORD_DATA
         audio_service_.EncodeWakeWord();
+#endif
         auto wake_word = audio_service_.GetLastWakeWord();
+        SetPendingWakeWordInvoke(wake_word);
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update),
             // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
+            Schedule([this]() {
+                ProcessPendingAudioAction();
             });
             return;
         }
         // Channel already opened, continue directly
         ContinueWakeWordInvoke(wake_word);
+    } else if (state == kDeviceStateConnecting) {
+#if CONFIG_SEND_WAKE_WORD_DATA
+        audio_service_.EncodeWakeWord();
+#endif
+        SetPendingWakeWordInvoke(wake_word);
+        ESP_LOGI(TAG, "Queued wake word while audio channel is connecting");
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
@@ -822,33 +976,8 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
-    // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
-        return;
-    }
-
-    if (!protocol_->IsAudioChannelOpened()) {
-        if (!protocol_->OpenAudioChannel()) {
-            audio_service_.EnableWakeWordDetection(true);
-            return;
-        }
-    }
-
-    ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
-#if CONFIG_SEND_WAKE_WORD_DATA
-    // Encode and send the wake word data to the server
-    while (auto packet = audio_service_.PopWakeWordPacket()) {
-        protocol_->SendAudio(std::move(packet));
-    }
-    // Set the chat state to wake word detected
-    protocol_->SendWakeWordDetected(wake_word);
-    SetListeningMode(GetDefaultListeningMode());
-#else
-    // Set flag to play popup sound after state changes to listening
-    // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
-    play_popup_on_listening_ = true;
-    SetListeningMode(GetDefaultListeningMode());
-#endif
+    SetPendingWakeWordInvoke(wake_word);
+    ProcessPendingAudioAction();
 }
 
 void Application::HandleStateChangedEvent() {
@@ -877,6 +1006,13 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
+            ESP_LOGI(TAG,
+                "Entering listening: mode=%d popup=%d processor_running=%d wake_word_running=%d channel_open=%d",
+                static_cast<int>(listening_mode_),
+                play_popup_on_listening_ ? 1 : 0,
+                audio_service_.IsAudioProcessorRunning() ? 1 : 0,
+                audio_service_.IsWakeWordRunning() ? 1 : 0,
+                (protocol_ != nullptr && protocol_->IsAudioChannelOpened()) ? 1 : 0);
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
@@ -910,8 +1046,8 @@ void Application::HandleStateChangedEvent() {
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
-                // Only AFE wake word can be detected in speaking mode
-                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                // Keep speaking mode lightweight and rely on touch/button to interrupt playback.
+                audio_service_.EnableWakeWordDetection(false);
             }
             audio_service_.ResetDecoder();
             break;
@@ -1023,7 +1159,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     auto state = GetDeviceState();
     
     if (state == kDeviceStateIdle) {
+#if CONFIG_SEND_WAKE_WORD_DATA
         audio_service_.EncodeWakeWord();
+#endif
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);

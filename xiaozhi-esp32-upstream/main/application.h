@@ -39,6 +39,12 @@ enum AecMode {
     kAecOnServerSide,
 };
 
+enum PendingAudioAction {
+    kPendingAudioActionNone,
+    kPendingAudioActionStartListening,
+    kPendingAudioActionWakeWordInvoke,
+};
+
 class Application {
 public:
     static Application& GetInstance() {
@@ -140,6 +146,10 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    PendingAudioAction pending_audio_action_ = kPendingAudioActionNone;
+    ListeningMode pending_listening_mode_ = kListeningModeAutoStop;
+    std::string pending_wake_word_;
+    bool pending_play_popup_on_listening_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -155,6 +165,10 @@ private:
     void HandleWakeWordDetectedEvent();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void ContinueWakeWordInvoke(const std::string& wake_word);
+    void ClearPendingAudioAction();
+    void SetPendingStartListening(ListeningMode mode, bool play_popup);
+    void SetPendingWakeWordInvoke(const std::string& wake_word);
+    void ProcessPendingAudioAction();
 
     // Activation task (runs in background)
     void ActivationTask();
