@@ -231,19 +231,27 @@ MCP 或桥接器发起拍照请求
 
 **能跑，但有前提。**
 
-## ⚠️ 重要提示：硬件优化补丁说明 (回滚残留提醒)
+## ⚠️ 历史说明：回滚后的硬件优化排查记录
 
-**注意：当前仓库执行过 Git 回滚操作，部分关键的硬件优化补丁已被丢弃，请在下次部署前手动或通过 AI 恢复：**
+**这一段最初是一次 Git 回滚后的自用排查备忘，不应简单理解为“当前仓库这 4 个修复都还缺着”。**
 
-1.  **PSRAM 模式修复 (解决 WiFi 内存分配失败)**：
-    -   需在 `firmware/sdkconfig.defaults` 中确保开启 `CONFIG_SPIRAM_MODE_QUAD=y`。
-2.  **WiFi Modem Sleep 延迟修复 (解决语音丢包与延迟)**：
-    -   需在 `firmware/main/hal/board/stackchan.cc` 中将 `LOW_POWER` 模式收敛到 `BALANCED`。
-3.  **MCP 语音回环修复 (解决“听回自己说的话”)**：
-    -   需在 `vps_bridge.py` 的 `run_tts_response` 中加入 `session.audio_frames.clear()` 等清理逻辑。
-4.  **I2C 兼容性修复 (TryReadRegs)**：
-    -   需要避免把触摸读取失败直接升级为 `ESP_ERROR_CHECK` 崩溃。
-    -   当前版本应保留“读取失败时跳过并记录日志”的容错行为，不能因为单次 I2C 失败直接重启。
+当时主要是担心下面几类关键修复在回滚中被一起带掉，所以先把怀疑点记在了 `README` 里，方便下次部署前复查：
+
+1.  **PSRAM 模式相关设置**
+    -   早先曾怀疑 `firmware/sdkconfig.defaults` 里缺少显式的 `CONFIG_SPIRAM_MODE_QUAD=y`，可能导致某些环境下出现 WiFi 相关内存分配失败。
+    -   当前仓库里已经保留了 `CONFIG_SPIRAM=y`、`CONFIG_SPIRAM_SPEED_80M=y` 等配置，但是否还需要额外显式写死 `QUAD`，仍应按你当下的 `ESP-IDF` 版本和实际构建结果确认。
+2.  **WiFi Modem Sleep 延迟修复**
+    -   当前代码里已经把 `LOW_POWER` 模式收敛到 `BALANCED`，避免语音链路在调制解调器省电模式下更容易出现丢包和延迟。
+3.  **MCP 语音回环修复**
+    -   当前 `vps_bridge.py` 已保留音频缓冲清理逻辑，`run_tts_response` 的相关路径里会调用 `clear_session_audio_buffer(session)`，避免把刚播放过的音频残留继续送去识别。
+4.  **I2C 兼容性修复 (TryReadRegs / 触摸读取容错)**
+    -   当前版本应保留“读取失败时跳过并记录日志”的行为，不能因为单次触摸/I2C 读取失败直接触发崩溃或重启。
+
+更准确地说，这一节现在应该被当作：
+
+- 一次回滚后的历史排查记录
+- 以后排查“为什么突然又不稳了”时可参考的怀疑点清单
+- 而不是当前仓库的实时缺陷列表
 
 
 - 如果你只是想在本地电脑上运行 Python 桥接器，这个是可以的。
